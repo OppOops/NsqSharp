@@ -18,6 +18,149 @@ namespace NsqSharp.Utils.Extensions
             return (T)Coerce(value, typeof(T));
         }
 
+
+        private static readonly Dictionary<string, double> _unitMap = new Dictionary<string, double>
+                                                                     {
+                                                                         {"ns", 1},
+                                                                         {"us", 1_000},
+                                                                         // U+00B5 = micro symbol
+                                                                         {"µs", 1_000},
+                                                                         // U+03BC = Greek letter mu
+                                                                         {"μs", 1_000},
+                                                                         {"ms", 1_000_000},
+                                                                         {"s", 1_000_000_000},
+                                                                         {"m", 60_000_000_000},
+                                                                         {"h", 3_600_000_000_000},
+                                                                     };
+        private static long leadingInt(ref Slice<char> s)
+        {
+            int i = 0;
+            long x = 0;
+            for (; i < s.Len(); i++)
+            {
+                char c = s[i];
+                if (c < '0' || c > '9')
+                {
+                    break;
+                }
+                if (x >= (long.MaxValue - 10) / 10)
+                {
+                    // overflow
+                    throw new OverflowException(s.ToString());
+                }
+                x = x * 10 + (c - '0');
+            }
+            s = s.Slc(i);
+            return x;
+        }
+
+        private static long ParseDuration(string value)
+        {
+            if (value == null)
+                throw new ArgumentNullException("value");
+
+            // [-+]?([0-9]*(\.[0-9]*)?[a-z]+)+
+            string orig = value;
+            long f = 0;
+            bool neg = false;
+            Slice<char> s = new Slice<char>(value);
+
+            // Consume [-+]?
+            if (s != "")
+            {
+                var c = s[0];
+                if (c == '-' || c == '+')
+                {
+                    neg = (c == '-');
+                    s = s.Slc(1);
+                }
+            }
+
+            // Special case: if all that is left is "0", this is zero.
+            if (s == "0")
+            {
+                return 0;
+            }
+
+            if (s == "")
+            {
+                throw new InvalidDataException("time: invalid duration " + orig);
+            }
+
+            while (s != "")
+            {
+                // The next character must be [0-9.]
+                if (!(s[0] == '.' || ('0' <= s[0] && s[0] <= '9')))
+                {
+                    throw new InvalidDataException("time: invalid duration " + orig);
+                }
+
+                // Consume [0-9]*
+                var pl1 = s.Len();
+                long x = leadingInt(ref s);
+
+                double g = x;
+                bool pre = (pl1 != s.Len()); // whether we consumed anything before a period
+
+                // Consume (\.[0-9]*)?
+                bool post = false;
+                if (s != "" && s[0] == '.')
+                {
+                    s = s.Slc(1);
+                    int pl2 = s.Len();
+                    x = leadingInt(ref s);
+                    double scale = 1.0;
+                    for (var n = pl2 - s.Len(); n > 0; n--)
+                    {
+                        scale *= 10;
+                    }
+                    g += x / scale;
+                    post = (pl2 != s.Len());
+                }
+                if (!pre && !post)
+                {
+                    // no digits (e.g. ".s" or "-.s")
+                    throw new InvalidDataException("time: invalid duration " + orig);
+                }
+
+                // Consume unit.
+                int i = 0;
+                for (; i < s.Len(); i++)
+                {
+                    char c = s[i];
+                    if (c == '.' || ('0' <= c && c <= '9'))
+                    {
+                        break;
+                    }
+                }
+                if (i == 0)
+                {
+                    throw new InvalidDataException("time: missing unit in duration " + orig);
+                }
+                var u = s.Slc(0, i);
+                s = s.Slc(i);
+
+                double unit;
+                bool ok = _unitMap.TryGetValue(u.ToString(), out unit);
+                if (!ok)
+                {
+                    throw new InvalidDataException("time: unknown unit " + u + " in duration " + orig);
+                }
+
+                checked
+                {
+                    f += (long)(g * unit);
+                }
+            }
+
+            if (neg)
+            {
+                f = -f;
+            }
+
+            return f;
+        }
+
         /// <summary>
         /// Coerce a value to the specified <paramref name="targetType"/>. Supports Duration and Bool string/int formats.
         /// </summary>
@@ -89,7 +232,7 @@ namespace NsqSharp.Utils.Extensions
                     if (long.TryParse(strValue, out ms))
                         return TimeSpan.FromMilliseconds(ms);
 
-                    long ns = Time.ParseDuration(strValue);
+                    long ns = ParseDuration(strValue);
                     return new TimeSpan(ns / 100);
                 }
                 if (valueType == typeof(int) || valueType == typeof(long) || valueType == typeof(ulong))

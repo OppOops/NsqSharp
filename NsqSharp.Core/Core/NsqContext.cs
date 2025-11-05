@@ -5,6 +5,8 @@ using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Text;
 using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
 using NsqSharp.Utils;
 using NsqSharp.Utils.Channels;
 using NsqSharp.Utils.Extensions;
@@ -63,13 +65,96 @@ namespace NsqSharp.Core
         public bool backoff { get; set; }
     }
 
+    internal interface INsqContexet
+    {
+        void SetLogger(ILogger l, string format);
+
+        void OnContextIOError(Exception ex);
+    }
+
+    internal interface INsqCommandWritter
+    {
+        void WriteCommand(Command cmd);
+    }
+
+    internal class NsqConnectionBuilder
+    {
+        private readonly string _addr;
+        private readonly Config _config;
+        private readonly IConnDelegate _delegate;
+        private ILogger? logger;
+        private string logFmt = "{0}";
+        private CoreNsqConnectionHandler? Handler;
+
+        private NsqContext? ConnectionContext;
+        private ITcpConn? Connection;
+        private bool IsHandshaked = false;
+        private IdentifyResponse? LastResult;
+        public NsqConnectionBuilder(string addr, Config config, IConnDelegate connDelegate)
+        {
+            _addr = addr;
+            _config = config;
+            _delegate = connDelegate;
+        }
+
+        public void SetLogger(ILogger l, string logFormat)
+        {
+            logger = l;
+            this.logFmt = logFormat;
+        }
+
+        public async Task Dial(CancellationToken token = default)
+        {
+            var ctx = new NsqContext(_addr, _config, _delegate);
+            if(this.logger !=null && !string.IsNullOrWhiteSpace(this.logFmt))
+            {
+                ctx.SetLogger(this.logger, this.logFmt);
+            }
+            var conn = await Net.DialTimeoutAsync("tcp", _addr, _config.DialTimeout, token);
+            var _conn = (ITcpConn)conn;
+
+            ConnectionContext = ctx;
+            Connection = _conn;
+            Handler = new CoreNsqConnectionHandler(ctx, _conn, this.logger ?? null);
+        }
+
+        public IdentifyResponse HandShake(Action<INsqCommandWritter> initialHandshake)
+        {
+            if(IsHandshaked)
+                return LastResult ?? new IdentifyResponse(); // already handshaked
+            if(ConnectionContext == null)
+                throw new Exception("Call Dial() before HandShake()");
+            if (Connection == null)
+                throw new Exception("Call Dial() before HandShake()");
+            if (Handler == null)
+                throw new Exception("Call Dial() before HandShake()");
+            IsHandshaked = true;
+            LastResult = ConnectionContext.Handshake(Connection, Handler, initialHandshake);
+            return LastResult;
+        }
+
+        public NsqContext GetNsqContext()
+        {
+            if (ConnectionContext == null)
+                throw new Exception("Does not connected");
+            return ConnectionContext;
+        }
+
+        public INsqConnection GetRuntimeConnection()
+        {
+            if (ConnectionContext == null || LastResult == null || Handler == null)
+                throw new Exception("Does not connected or handshaked");
+            return new RunTimeNsqConnectionHandler(Handler, ConnectionContext.CommandWriter);
+        }
+    }
+
     /// <summary>
     /// Conn represents a connection to nsqd
     ///
     /// Conn exposes a set of callbacks for the
     /// various events that occur on a connection
     /// </summary>
-    public partial class Conn : IReader, IWriter, IConn
+    internal partial class NsqContext : INsqContexet
     {
         private static readonly byte[] HEARTBEAT_BYTES = Encoding.UTF8.GetBytes("_heartbeat_");
 
@@ -79,42 +164,29 @@ namespace NsqSharp.Core
         private long _lastRdyCount;
         private long _lastMsgTimestamp;
 
-        private readonly object _mtx = new object();
-
         private readonly Config _config;
 
-        private ITcpConn _conn;
         private readonly string _addr;
 
         private readonly IConnDelegate _delegate;
 
-        private ILogger _logger;
-        private string _logFmt;
+        private ILogger? _logger;
+        private string _logFmt = "{0}";
 
-        private IReader _r;
-        private IWriter _w;
+        private readonly Channel<Command> _cmdChan;
+        private readonly Channel<(Command, TaskCompletionSource<bool>)> _cmdTraceChan;
+        private readonly Channel<msgResponse> _consumerMsgResponseChan;
 
-        private readonly Chan<Command> _cmdChan;
-        private readonly Chan<msgResponse> _msgResponseChan;
-        private readonly Chan<int> _exitChan;
-        private readonly Chan<int> _drainReady;
-
-        private int _closeFlag;
-        private readonly Once _stopper = new Once();
-        private readonly WaitGroup _wg = new WaitGroup();
-        private int _readLoopRunning;
+        private readonly Once _stopper = new();
+        private CancellationTokenSource ConnectionCancelContext = new();
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="Conn"/> class.
+        /// Initializes a new instance of the <see cref="NsqContext"/> class.
         /// </summary>
-        public Conn(string addr, Config config, IConnDelegate connDelegate)
+        public NsqContext(string addr, Config config, IConnDelegate connDelegate)
         {
             if (string.IsNullOrEmpty(addr))
-                throw new ArgumentNullException("addr");
-            if (config == null)
-                throw new ArgumentNullException("config");
-            if (connDelegate == null)
-                throw new ArgumentNullException("connDelegate");
+                throw new ArgumentNullException(nameof(addr));
 
             _addr = addr;
 
@@ -124,11 +196,12 @@ namespace NsqSharp.Core
             _maxRdyCount = 2500;
             _lastMsgTimestamp = DateTime.Now.UnixNano();
 
-            _cmdChan = new Chan<Command>();
-            _msgResponseChan = new Chan<msgResponse>();
-            _exitChan = new Chan<int>();
-            _drainReady = new Chan<int>();
+            _cmdChan = Channel.CreateUnbounded<Command>();
+            _cmdTraceChan = Channel.CreateUnbounded<(Command, TaskCompletionSource<bool>)>();
+            _consumerMsgResponseChan = Channel.CreateUnbounded<msgResponse>();
         }
+
+        public ChannelWriter<Command> CommandWriter => _cmdChan.Writer;
 
         /// <summary>
         /// SetLogger assigns the logger to use as well as a level.
@@ -140,9 +213,6 @@ namespace NsqSharp.Core
         /// </summary>
         public void SetLogger(ILogger l, string format)
         {
-            if (l == null)
-                throw new ArgumentNullException("l");
-
             _logger = l;
             _logFmt = format;
             if (string.IsNullOrWhiteSpace(_logFmt))
@@ -152,35 +222,32 @@ namespace NsqSharp.Core
         }
 
         /// <summary>
-        /// Connect dials and bootstraps the nsqd connection
+        /// handshake the nsqd connection
         /// (including IDENTIFY) and returns the IdentifyResponse
         /// </summary>
-        public IdentifyResponse Connect()
+        internal IdentifyResponse Handshake(
+            ITcpConn _conn,
+            CoreNsqConnectionHandler handler,
+            Action<INsqCommandWritter> initialHandshake)
         {
-            var conn = Net.DialTimeout("tcp", _addr, _config.DialTimeout);
-            _conn = (ITcpConn)conn;
-            if (_conn == null)
-                throw new Exception("Net.DialTimeout returned null");
-            _r = conn;
-            _w = conn;
-
             _conn.ReadTimeout = _config.ReadTimeout;
             _conn.WriteTimeout = _config.WriteTimeout;
-
+            var cts = ConnectionCancelContext = handler.ConnectionCancelContext;
             try
             {
-                Write(Protocol.MagicV2, 0, Protocol.MagicV2.Length);
+                handler.Write(Protocol.MagicV2, 0, Protocol.MagicV2.Length);
             }
             catch (Exception ex)
             {
-                _conn.Close();
+                cts.Cancel();
                 throw new Exception(string.Format("[{0}] failed to write magic - {1}", _addr, ex.Message), ex);
             }
 
             IdentifyResponse resp;
             try
             {
-                resp = identify();
+                resp = NsqConnectionHandshake.Identify(this._config, handler, handler, this._logger, _conn);
+                this._maxRdyCount = resp.MaxRdyCount;
             }
             catch (ErrIdentify ex)
             {
@@ -195,23 +262,33 @@ namespace NsqSharp.Core
                         "Producers must connect to nsqd over TCP (4150). Consumers can connect to nsqd over TCP (4150) using " +
                         "Consumer.ConnectToNsqd or to nsqlookupd (4161) using Consumer.ConnectToNsqLookupd.", ex);
                 }
+                cts.Cancel();
                 throw;
             }
 
-            if (resp != null && resp.AuthRequired)
+            try
             {
-                if (string.IsNullOrEmpty(_config.AuthSecret))
+                if (resp.AuthRequired)
                 {
-                    log(LogLevel.Error, "Auth Required");
-                    throw new Exception("Auth Required");
+                    if (string.IsNullOrEmpty(_config.AuthSecret))
+                    {
+                        WriteLog(LogLevel.Error, "Auth Required");
+                        throw new Exception("Auth Required");
+                    }
+                    NsqConnectionHandshake.Auth(handler, _config.AuthSecret, _logger);
                 }
-                auth(_config.AuthSecret);
+                initialHandshake(handler);
+            }
+            catch
+            {
+                cts.Cancel();
+                throw;
             }
 
-            _wg.Add(2);
-            _readLoopRunning = 1;
-            GoFunc.Run(readLoop, "Conn:readLoop");
-            GoFunc.Run(writeLoop, "Conn:writeLoop");
+            var readLoopCtx = new RunningLoopContext(handler.ConnectionCancelContext);
+            var writeLoopCtx = new RunningLoopContext(handler.ConnectionCancelContext);
+            _ = Task.Run(()=> RunReadLoop(handler, readLoopCtx));
+            _ = RunWriteLoop(handler, writeLoopCtx);
             return resp;
         }
 
@@ -220,11 +297,7 @@ namespace NsqSharp.Core
         /// </summary>
         public void Close()
         {
-            _closeFlag = 1;
-            if (_conn != null && _messagesInFlight == 0)
-            {
-                _conn.Close();
-            }
+            ConnectionCancelContext.Cancel();
         }
 
         /// <summary>
@@ -232,10 +305,7 @@ namespace NsqSharp.Core
         /// connection is currently in the processing of
         /// gracefully closing
         /// </summary>
-        public bool IsClosing
-        {
-            get { return (_closeFlag == 1); }
-        }
+        public bool IsClosing => ConnectionCancelContext.Token.IsCancellationRequested;
 
         /// <summary>
         /// RDY returns the current RDY count
@@ -263,6 +333,14 @@ namespace NsqSharp.Core
             _lastRdyCount = rdy;
         }
 
+        private static readonly DateTime _epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        private const long Second = 1_000_000_000;
+        private static DateTime Unix(long sec, long nsec)
+        {
+            long ticks = sec * Second / 100 + nsec / 100;
+            return _epoch.AddTicks(ticks);
+        }
+
         /// <summary>
         /// MaxRDY returns the nsqd negotiated maximum
         /// RDY count that it will accept for this connection
@@ -278,7 +356,7 @@ namespace NsqSharp.Core
         /// </summary>
         public DateTime LastMessageTime
         {
-            get { return Time.Unix(0, _lastMsgTimestamp); }
+            get { return Unix(0, _lastMsgTimestamp); }
         }
 
         /// <summary>
@@ -298,13 +376,78 @@ namespace NsqSharp.Core
             return _addr;
         }
 
+        public bool WriteCommandToChannel(Command cmd)
+        {
+            return _cmdChan.Writer.TryWrite(cmd);
+        }
+
+        public async Task<bool> WriteCommandTask(Command cmd, CancellationToken token = default)
+        {
+            var tcs = new TaskCompletionSource<bool>();
+            token.Register(() => tcs.TrySetCanceled());
+            if (this.ConnectionCancelContext.IsCancellationRequested)
+            {
+                return false; // cannot sent message due to context exit
+            }
+            else if (!_cmdTraceChan.Writer.TryWrite((cmd,tcs)))
+            {
+                return false; // the channel cannot accept more messages
+            }
+            return await tcs.Task;
+        }
+
+        public void OnContextIOError(Exception ex)
+        {
+            this._delegate.OnIOError(this, ex);
+        }
+    }
+
+    internal class CoreNsqConnectionHandler : IReader, IWriter, INsqConnection, INsqCommandWritter
+    {
+        private readonly ITcpConn _conn;
+
+        private readonly ILogger? _logger;
+
+        private readonly INsqContexet NsqConnectionInstance;
+
+        /// <summary>
+        /// Cancel if the io stream is closed
+        /// </summary>
+        public CancellationTokenSource ConnectionCancelContext { get; } = new();
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="NsqContext"/> class.
+        /// </summary>
+        public CoreNsqConnectionHandler(INsqContexet nsqContext,
+            ITcpConn conn, 
+            ILogger? logger)
+        {
+            NsqConnectionInstance = nsqContext;
+            _conn = conn;
+            _logger = logger;
+            ConnectionCancelContext.Token.Register(() =>
+            {
+                conn.Close();
+            });
+        }
+
+        public IdentifyResponse Connect(Action<INsqCommandWritter> initialHandshake) =>
+            throw new NotImplementedException();
+
+        public void SetLogger(ILogger l, string format) => this.NsqConnectionInstance.SetLogger(l, format);
+
+        public void Close()
+        {
+            ConnectionCancelContext.Cancel();
+        }
+
         /// <summary>
         /// Read performs a deadlined read on the underlying TCP connection
         /// </summary>
         public int Read(byte[] p)
         {
             // SetReadDeadline handled in Connect
-            return _r.Read(p);
+            return _conn.Read(p);
         }
 
         /// <summary>
@@ -313,7 +456,7 @@ namespace NsqSharp.Core
         public int Write(byte[] p, int offset, int length)
         {
             // SetWriteDeadline handled in Connect
-            return _w.Write(p, offset, length);
+            return _conn.Write(p, offset, length);
         }
 
         private int _bigBufSize = 4096;
@@ -325,63 +468,122 @@ namespace NsqSharp.Core
         /// </summary>
         public void WriteCommand(Command cmd)
         {
-            if (cmd == null)
-                throw new ArgumentNullException("cmd");
-
             try
             {
-                lock (_mtx)
+                int size = cmd.GetByteCount();
+                if (size > _bigBufSize)
                 {
-                    int size = cmd.GetByteCount();
-                    if (size > _bigBufSize)
-                    {
-                        _bigBuf = new byte[size];
-                        _bigBufSize = size;
-                    }
-
-                    cmd.WriteTo(this, _bigBuf);
-
-                    Flush();
+                    _bigBuf = new byte[size];
+                    _bigBufSize = size;
                 }
+
+                cmd.WriteTo(this, _bigBuf);
+
+                _conn.Flush();
             }
             catch (Exception ex)
             {
                 object msg = (ex is ConnectionClosedException) ? ex.Message : (object)ex;
-                log(LogLevel.Error, string.Format("Conn.WriteCommand IO error - {0}", msg));
-                _delegate.OnIOError(this, ex);
+                _logger?.Output(LogLevel.Error, string.Format("Conn.WriteCommand IO error - {0}", msg));
+                this.NsqConnectionInstance.OnContextIOError(ex);
                 throw;
             }
         }
     }
 
-    internal interface IFlusher
+    internal class RunningLoopContext
     {
-        void Flush();
-    }
+        public CancellationTokenSource LoopTokenSource { get; }
 
-    public partial class Conn
-    {
-        /// <summary>
-        /// Flush writes all buffered data to the underlying TCP connection
-        /// </summary>
-        public void Flush()
+        private readonly CancellationTokenSource ConnectionTokenSource;
+
+        public RunningLoopContext(CancellationTokenSource connectionTokenSource)
         {
-            _conn.Flush();
+            ConnectionTokenSource = connectionTokenSource;
+            LoopTokenSource = CancellationTokenSource.CreateLinkedTokenSource(connectionTokenSource.Token);
         }
 
-        private IdentifyResponse identify()
+        public void SetIoClosing()
         {
-            var ci = new IdentifyRequest();
-            ci.client_id = _config.ClientID;
-            ci.hostname = _config.Hostname;
-            ci.user_agent = _config.UserAgent;
-            ci.short_id = _config.ClientID; // deprecated
-            ci.long_id = _config.Hostname;  // deprecated
-            ci.tls_v1 = (_config.TlsConfig != null);
-            ci.deflate = false; //_config.Deflate; // TODO: Deflate
-            ci.deflate_level = 6; //_config.DeflateLevel; // TODO: Deflate
-            ci.snappy = false; //_config.Snappy; // TODO: Snappy
-            ci.feature_negotiation = true;
+            this.ConnectionTokenSource.Cancel();
+        }
+    }
+
+    internal class RunTimeNsqConnectionHandler : INsqConnection, INsqCommandWritter
+    {
+        private INsqConnection Handler;
+        private readonly ChannelWriter<Command> Writer;
+        public RunTimeNsqConnectionHandler(INsqConnection handler, ChannelWriter<Command> writer)
+        {
+            Writer = writer;
+            Handler = handler;
+        }
+
+        public void Close()
+        {
+            Handler.Close();
+        }
+
+        public IdentifyResponse Connect(Action<INsqCommandWritter> initialHandshake)
+        {
+            return Handler.Connect(initialHandshake);
+        }
+
+        public void SetLogger(ILogger l, string format)
+        {
+            Handler.SetLogger(l, format);
+        }
+
+        public void WriteCommand(Command command)
+        {
+            Writer.TryWrite(command);
+        }
+    }
+
+    internal class EmptyNsqConnectionHandler : INsqConnection
+    {
+        public void Close()
+        {
+            throw new NotImplementedException();
+        }
+
+        public IdentifyResponse Connect(Action<INsqCommandWritter> initialHandshake)
+        {
+            throw new NotImplementedException();
+        }
+
+        public void SetLogger(ILogger l, string format)
+        {
+            throw new NotImplementedException();
+        }
+
+        public void WriteCommand(Command command)
+        {
+            throw new NotImplementedException();
+        }
+    }
+
+    internal static class NsqConnectionHandshake
+    {
+        public static IdentifyResponse Identify(Config _config, 
+            INsqCommandWritter commandWriter, 
+            IReader reader, 
+            ILogger? logger,
+            IConn originalInstance)
+        {
+            var ci = new IdentifyRequest
+            {
+                client_id = _config.ClientID,
+                hostname = _config.Hostname,
+                user_agent = _config.UserAgent,
+                short_id = _config.ClientID, // deprecated
+                long_id = _config.Hostname,  // deprecated
+                tls_v1 = (_config.TlsConfig != null),
+                deflate = false, //_config.Deflate; // TODO: Deflate
+                deflate_level = 6, //_config.DeflateLevel; // TODO: Deflate
+                snappy = false, //_config.Snappy; // TODO: Snappy
+                feature_negotiation = true
+            };
             if (_config.HeartbeatInterval <= TimeSpan.Zero)
             {
                 ci.heartbeat_interval = -1;
@@ -404,12 +606,10 @@ namespace NsqSharp.Core
 
             try
             {
-                var cmd = Command.Identify(ci);
-                WriteCommand(cmd);
 
-                FrameType frameType;
-                byte[] data;
-                Protocol.ReadUnpackedResponse(this, out frameType, out data);
+                commandWriter.WriteCommand(Command.Identify(ci));
+
+                Protocol.ReadUnpackedResponse(reader, out FrameType frameType, out byte[] data);
 
                 string json = Encoding.UTF8.GetString(data);
 
@@ -422,25 +622,25 @@ namespace NsqSharp.Core
                 // i.e. it was a JSON response
                 if (data[0] != '{')
                 {
-                    return null;
+                    throw new ErrIdentify(json);
                 }
 
                 string respJson = Encoding.UTF8.GetString(data);
-                log(LogLevel.Debug, string.Format("IDENTIFY response: {0}", respJson));
+                logger?.Output(LogLevel.Debug, string.Format("IDENTIFY response: {0}", respJson));
 
-                IdentifyResponse resp;
+                IdentifyResponse? resp;
                 var serializer = new DataContractJsonSerializer(typeof(IdentifyResponse));
                 using (var memoryStream = new MemoryStream(data))
                 {
-                    resp = (IdentifyResponse)serializer.ReadObject(memoryStream);
+                    resp = (IdentifyResponse?)serializer.ReadObject(memoryStream);
                 }
-
-                _maxRdyCount = resp.MaxRdyCount;
+                if(resp == null)
+                    throw new Exception("Failed to deserialize IdentifyResponse");
 
                 if (resp.TLSv1)
                 {
-                    log(LogLevel.Info, "upgrading to TLS");
-                    upgradeTLS(_config.TlsConfig);
+                    logger?.Output(LogLevel.Info, "upgrading to TLS");
+                    UpgradeTLS(_config.TlsConfig, reader, originalInstance);
                 }
 
                 // TODO: Deflate
@@ -482,19 +682,50 @@ namespace NsqSharp.Core
             }
         }
 
-        private void upgradeTLS(TlsConfig tlsConfig)
+        private static void UpgradeTLS(TlsConfig? tlsConfig, IReader reader, IConn originalInstance)
         {
-            if (tlsConfig == null)
-                throw new ArgumentNullException("tlsConfig", "Set Config.TlsConfig to use TLS");
+            ArgumentNullException.ThrowIfNull(tlsConfig, nameof(tlsConfig));
 
-            ((TcpConn)_conn).UpgradeTls(tlsConfig);
+            if(originalInstance is not TcpConn _conn)
+            {
+                throw new ArgumentException("originalInstance must be of type TcpConn to upgrade TLS");
+            }
+            _conn.UpgradeTLS(tlsConfig);
 
-            FrameType frameType;
-            byte[] body;
-            Protocol.ReadUnpackedResponse(this, out frameType, out body);
+            Protocol.ReadUnpackedResponse(reader, out FrameType frameType, out byte[] body);
             if (frameType != FrameType.Response || !body.SequenceEqual(Encoding.UTF8.GetBytes("OK")))
                 throw new Exception("invalid response from TLS upgrade");
         }
+
+        public static void Auth(CoreNsqConnectionHandler handler, string secret, ILogger? logger)
+        {
+            handler.WriteCommand(Command.Auth(secret));
+
+            Protocol.ReadUnpackedResponse(handler, out FrameType frameType, out byte[] data);
+
+            string json = Encoding.UTF8.GetString(data);
+
+            if (frameType == FrameType.Error)
+            {
+                throw new Exception(string.Format("Error authenticating {0}", json));
+            }
+
+            AuthResponse? resp;
+            var serializer = new DataContractJsonSerializer(typeof(AuthResponse));
+            using (var memoryStream = new MemoryStream(data))
+            {
+                resp = (AuthResponse?)serializer.ReadObject(memoryStream);
+            }
+            if (resp == null)
+                throw new Exception("Failed to deserialize AuthResponse");
+
+            logger?.Output(LogLevel.Info, string.Format("Auth accepted. Identity: {0} {1} Permissions: {2}",
+                resp.Identity, resp.IdentityUrl, resp.PermissionCount));
+        }
+    }
+
+    internal partial class NsqContext
+    {
 
         /*private void upgradeDeflate()
         {
@@ -505,83 +736,37 @@ namespace NsqSharp.Core
         {
             // TODO
         }*/
-
-        private void auth(string secret)
-        {
-            var cmd = Command.Auth(secret);
-
-            WriteCommand(cmd);
-
-            FrameType frameType;
-            byte[] data;
-            Protocol.ReadUnpackedResponse(this, out frameType, out data);
-
-            string json = Encoding.UTF8.GetString(data);
-
-            if (frameType == FrameType.Error)
-            {
-                throw new Exception(string.Format("Error authenticating {0}", json));
-            }
-
-            AuthResponse resp;
-            var serializer = new DataContractJsonSerializer(typeof(AuthResponse));
-            using (var memoryStream = new MemoryStream(data))
-            {
-                resp = (AuthResponse)serializer.ReadObject(memoryStream);
-            }
-
-            log(LogLevel.Info, string.Format("Auth accepted. Identity: {0} {1} Permissions: {2}",
-                resp.Identity, resp.IdentityUrl, resp.PermissionCount));
-        }
-
-        private void readLoop()
+        private void RunReadLoop(CoreNsqConnectionHandler handler, RunningLoopContext readLoopCtx)
         {
             try
             {
-                var msgDelegate = new ConnMessageDelegate { c = this };
-
-                bool doLoop = true;
-                while (doLoop)
+                var cts = readLoopCtx.LoopTokenSource;
+                var token = readLoopCtx.LoopTokenSource.Token;
+                while (!token.IsCancellationRequested)
                 {
-                    if (_closeFlag == 1)
-                    {
-                        break;
-                    }
-
                     FrameType frameType;
                     byte[] data;
                     try
                     {
-                        Protocol.ReadUnpackedResponse(this, out frameType, out data);
+                        Protocol.ReadUnpackedResponse(handler, out frameType, out data);
                     }
                     catch (Exception ex)
                     {
                         // TODO: determine equivalent exception type from .NET runtime
                         // if !strings.Contains(err.Error(), "use of closed network connection")
-                        if (_closeFlag != 1)
+                        if (!token.IsCancellationRequested)
                         {
-                            log(LogLevel.Error, string.Format("IO error on ReadUnpackedResponse - {0}", ex));
+                            WriteLog(LogLevel.Error, string.Format("IO error on ReadUnpackedResponse - {0}", ex));
                             _delegate.OnIOError(this, ex);
                         }
+                        cts.Cancel();
                         break;
                     }
 
                     if (frameType == FrameType.Response && HEARTBEAT_BYTES.SequenceEqual(data))
                     {
                         _delegate.OnHeartbeat(this);
-                        try
-                        {
-                            WriteCommand(Command.Nop());
-                        }
-                        catch (Exception ex)
-                        {
-                            if (_closeFlag != 1)
-                            {
-                                log(LogLevel.Error, string.Format("IO error on Heartbeat - {0}", ex));
-                                _delegate.OnIOError(this, ex);
-                            }
-                            break;
-                        }
+                        this.WriteCommandToChannel(Command.Nop());
                         continue;
                     }
 
@@ -598,12 +783,12 @@ namespace NsqSharp.Core
                             }
                             catch (Exception ex)
                             {
-                                log(LogLevel.Error, string.Format("IO error on DecodeMessage - {0}", ex));
+                                WriteLog(LogLevel.Error, string.Format("IO error on DecodeMessage - {0}", ex));
                                 _delegate.OnIOError(this, ex);
-                                doLoop = false;
+                                cts.Cancel();
                                 break;
                             }
-                            msg.Delegate = msgDelegate;
+                            msg.Delegate = new ConnMessageDelegate(context: this);
                             msg.NsqdAddress = ToString();
 
                             Interlocked.Decrement(ref _rdyCount);
@@ -614,14 +799,14 @@ namespace NsqSharp.Core
                             break;
                         case FrameType.Error:
                             string errMsg = Encoding.UTF8.GetString(data);
-                            log(LogLevel.Error, string.Format("protocol error - {0}", errMsg));
+                            WriteLog(LogLevel.Error, string.Format("protocol error - {0}", errMsg));
                             _delegate.OnError(this, data);
                             break;
                         default:
                             // TODO: what would 'err' be in this case?
                             // https://github.com/nsqio/go-nsq/blob/v1.0.3/conn.go#L518
                             var unknownFrameTypeEx = new Exception(string.Format("unknown frame type {0}", frameType));
-                            log(LogLevel.Error, string.Format("IO error - {0}", unknownFrameTypeEx.Message));
+                            WriteLog(LogLevel.Error, string.Format("IO error - {0}", unknownFrameTypeEx.Message));
                             _delegate.OnIOError(this, unknownFrameTypeEx);
                             break;
                     }
@@ -630,106 +815,96 @@ namespace NsqSharp.Core
             finally
             {
                 //exit:
-                _readLoopRunning = 0;
                 var messagesInFlight = _messagesInFlight;
                 if (messagesInFlight == 0)
                 {
                     // if we exited readLoop with no messages in flight
                     // we need to explicitly trigger the close because
                     // writeLoop won't
-                    close();
+                    Dispose();
                 }
                 else
                 {
-                    log(LogLevel.Warning, string.Format("delaying close, {0} outstanding messages", messagesInFlight));
+                    WriteLog(LogLevel.Warning, string.Format("delaying close, {0} outstanding messages", messagesInFlight));
                 }
-                _wg.Done();
-                log(LogLevel.Info, "readLoop exiting");
+                WriteLog(LogLevel.Info, "readLoop exiting");
             }
         }
 
-        private void writeLoop()
+        private async Task RunWriteLoop(CoreNsqConnectionHandler handler, RunningLoopContext writeLoopCtx)
         {
-            bool doLoop = true;
-            using (var select =
-                Select
-                    .CaseReceive(_exitChan, o =>
+            var token = writeLoopCtx.LoopTokenSource.Token;
+            var select =
+            Select
+                .CaseReceive(_cmdChan, cmd =>
+                {
+                    try
                     {
-                        log(LogLevel.Info, "breaking out of writeLoop");
-                        // Indicate drainReady because we will not pull any more off msgResponseChan
-                        _drainReady.Close();
-                        doLoop = false;
-                    })
-                    .CaseReceive(_cmdChan, cmd =>
+                        handler.WriteCommand(cmd);
+                    }
+                    catch (Exception ex)
                     {
-                        try
-                        {
-                            WriteCommand(cmd);
-                        }
-                        catch (Exception ex)
-                        {
-                            object msg = (ex is ConnectionClosedException) ? ex.Message : (object)ex;
-                            log(LogLevel.Error, string.Format("Conn.writeLoop, cmdChan: error sending command {0} - {1}", cmd, msg));
-                            close();
-                        }
-                        // TODO: Create PR to remove unnecessary continue in go-nsq
-                        // https://github.com/nsqio/go-nsq/blob/v1.0.3/conn.go#L552
-                    })
-                    .CaseReceive(_msgResponseChan, resp =>
+                        object msg = (ex is ConnectionClosedException) ? ex.Message : (object)ex;
+                        WriteLog(LogLevel.Error, string.Format("Conn.writeLoop, cmdChan: error sending command {0} - {1}", cmd, msg));
+                        Dispose();
+                    }
+                    // TODO: Create PR to remove unnecessary continue in go-nsq
+                    // https://github.com/nsqio/go-nsq/blob/v1.0.3/conn.go#L552
+                })
+                .CaseReceive(_cmdTraceChan, (pair) =>
+                {
+                    var (cmd, tcs) = pair;
+                    try
                     {
-                        // Decrement this here so it is correct even if we can't respond to nsqd
-                        var msgsInFlight = Interlocked.Decrement(ref _messagesInFlight);
+                        handler.WriteCommand(cmd);
+                        tcs.TrySetResult(true);
+                    }
+                    catch (Exception ex)
+                    {
+                        object msg = (ex is ConnectionClosedException) ? ex.Message : (object)ex;
+                        WriteLog(LogLevel.Error, string.Format("Conn.writeLoop, cmdChan: error sending command {0} - {1}", cmd, msg));
+                        tcs.TrySetException(ex);
+                        Dispose();
+                    }
+                })
+                .CaseReceive(_consumerMsgResponseChan, resp =>
+                {
+                    // Decrement this here so it is correct even if we can't respond to nsqd
+                    var msgsInFlight = Interlocked.Decrement(ref _messagesInFlight);
 
-                        if (resp.success)
+                    if (resp.success)
+                    {
+                        WriteLog(LogLevel.Debug, string.Format("FIN {0}", resp.msg.Id));
+                        _delegate.OnMessageFinished(this, resp.msg);
+                        _delegate.OnResume(this);
+                    }
+                    else
+                    {
+                        WriteLog(LogLevel.Debug, string.Format("REQ {0}", resp.msg.Id));
+                        _delegate.OnMessageRequeued(this, resp.msg);
+                        if (resp.backoff)
                         {
-                            log(LogLevel.Debug, string.Format("FIN {0}", resp.msg.Id));
-                            _delegate.OnMessageFinished(this, resp.msg);
-                            _delegate.OnResume(this);
+                            _delegate.OnBackoff(this);
                         }
                         else
                         {
-                            log(LogLevel.Debug, string.Format("REQ {0}", resp.msg.Id));
-                            _delegate.OnMessageRequeued(this, resp.msg);
-                            if (resp.backoff)
-                            {
-                                _delegate.OnBackoff(this);
-                            }
-                            else
-                            {
-                                _delegate.OnContinue(this);
-                            }
+                            _delegate.OnContinue(this);
                         }
+                    }
 
-                        try
-                        {
-                            WriteCommand(resp.cmd);
-
-                            if (msgsInFlight == 0 && _closeFlag == 1)
-                            {
-                                close();
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            object msg = (ex is ConnectionClosedException) ? ex.Message : (object)ex;
-                            log(LogLevel.Error, string.Format("Conn.writeLoop, msgResponseChan: error sending command {0} - {1}", resp.cmd, msg));
-                            close();
-                        }
-                    })
-                    .NoDefault(defer: true))
+                    WriteCommandToChannel(resp.cmd);
+                });
+            
+            // ReSharper disable once LoopVariableIsNeverChangedInsideLoop
+            while (!token.IsCancellationRequested)
             {
-                // ReSharper disable once LoopVariableIsNeverChangedInsideLoop
-                while (doLoop)
-                {
-                    select.Execute();
-                }
+                await select.ExecuteAsync(token);
             }
 
-            _wg.Done();
-            log(LogLevel.Info, "writeLoop exiting");
+            WriteLog(LogLevel.Info, "writeLoop exiting");
         }
 
-        private void close()
+        private void Dispose()
         {
             // a "clean" connection close is orchestrated as follows:
             //
@@ -759,82 +934,16 @@ namespace NsqSharp.Core
 
             _stopper.Do(() =>
             {
-                log(LogLevel.Info, "beginning close");
-                _exitChan.Close();
-                _conn.Close();
-
-                _wg.Add(1);
-                GoFunc.Run(cleanup, "Conn:cleanup");
-
-                GoFunc.Run(waitForCleanup, "Conn:waitForCleanup");
+                WriteLog(LogLevel.Info, "clean close complete");
+                _delegate.OnClose(this);
             });
         }
-
-        private void cleanup()
+        internal void OnMessageFinish(Message m)
         {
-            _drainReady.Receive();
-            var ticker = new Ticker(TimeSpan.FromMilliseconds(100));
-            var lastWarning = DateTime.Now;
-
-            // writeLoop has exited, drain any remaining in flight messages
-            while (true)
-            {
-                // TODO: Review how reading off _msgResponseChan could impact
-
-                // we're racing with readLoop which potentially has a message
-                // for handling so infinitely loop until messagesInFlight == 0
-                // and readLoop has exited
-                long msgsInFlight = _messagesInFlight;
-
-                Select
-                    .CaseReceive(_msgResponseChan, o => msgsInFlight = Interlocked.Decrement(ref _messagesInFlight))
-                    .CaseReceive(ticker.C, o => msgsInFlight = _messagesInFlight)
-                    .NoDefault();
-
-                if (msgsInFlight > 0)
-                {
-                    if (DateTime.Now - lastWarning > TimeSpan.FromSeconds(1))
-                    {
-                        log(LogLevel.Warning, string.Format("draining... waiting for {0} messages in flight", msgsInFlight));
-                        lastWarning = DateTime.Now;
-                    }
-                    continue;
-                }
-
-                // until the readLoop has exited we cannot be sure that there
-                // still won't be a race
-                if (_readLoopRunning == 1)
-                {
-                    if (DateTime.Now - lastWarning > TimeSpan.FromSeconds(1))
-                    {
-                        log(LogLevel.Warning, "draining... readLoop still running");
-                        lastWarning = DateTime.Now;
-                    }
-                    continue;
-                }
-                break;
-            }
-
-            //exit:
-            ticker.Stop();
-            _wg.Done();
-            log(LogLevel.Info, "finished draining, cleanup exiting");
+            _consumerMsgResponseChan.Writer.TryWrite(new msgResponse { msg = m, cmd = Command.Finish(m.ID), success = true, backoff = true });
         }
 
-        private void waitForCleanup()
-        {
-            _wg.Wait();
-            _conn.Close();
-            log(LogLevel.Info, "clean close complete");
-            _delegate.OnClose(this);
-        }
-
-        internal void onMessageFinish(Message m)
-        {
-            _msgResponseChan.Send(new msgResponse { msg = m, cmd = Command.Finish(m.ID), success = true, backoff = true });
-        }
-
-        internal TimeSpan onMessageRequeue(Message m, TimeSpan? delay, bool backoff)
+        internal TimeSpan OnMessageRequeue(Message m, TimeSpan? delay, bool backoff)
         {
             if (delay == null || delay <= TimeSpan.Zero)
             {
@@ -847,7 +956,7 @@ namespace NsqSharp.Core
                 }
             }
 
-            _msgResponseChan.Send(new msgResponse
+            _consumerMsgResponseChan.Writer.TryWrite(new msgResponse
             {
                 msg = m,
                 cmd = Command.Requeue(m.ID, delay.Value),
@@ -858,23 +967,15 @@ namespace NsqSharp.Core
             return delay.Value;
         }
 
-        internal void onMessageTouch(Message m)
+        internal void OnMessageTouch(Message m)
         {
-            Select
-                .CaseSend(_cmdChan, Command.Touch(m.ID), () => { })
-                .CaseReceive(_exitChan, o => { })
-                .NoDefault();
+            _cmdChan.Writer.TryWrite(Command.Touch(m.ID));
         }
 
-        private void log(LogLevel lvl, string line)
+        private void WriteLog(LogLevel lvl, string line)
         {
-            // TODO: thread safety
-
-            if (_logger == null)
-                return;
-
             // TODO: Review format string
-            _logger.Output(lvl, string.Format("{0} {1}",
+            _logger?.Output(lvl, string.Format("{0} {1}",
                 string.Format(_logFmt, ToString()), line));
         }
     }

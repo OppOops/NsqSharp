@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Threading;
+using System.Threading.Channels;
 using NsqSharp.Utils.Channels;
 
 namespace NsqSharp.Utils
@@ -9,51 +10,34 @@ namespace NsqSharp.Utils
     /// </summary>
     public class Ticker
     {
-        private readonly Chan<DateTime> _tickerChan = new Chan<DateTime>();
-        private readonly object _locker = new object();
-        private System.Threading.Timer _threadingTimer;
-        private bool _stop;
+        private readonly Channel<DateTime> _tickerChan;
+        private readonly CancellationTokenSource TimerContext;
 
         /// <summary>
         /// Initializes a new instance of the Ticker class.
         /// </summary>
         /// <param name="duration">The interval between ticks on the channel.</param>
-        public Ticker(TimeSpan duration)
+        public Ticker(TimeSpan duration, CancellationToken token = default)
         {
             if (duration <= TimeSpan.Zero)
-                throw new ArgumentOutOfRangeException("duration", "duration must be > 0");
+                throw new ArgumentOutOfRangeException(nameof(duration), "duration must be > 0");
+
+            TimerContext = CancellationTokenSource.CreateLinkedTokenSource(token);
 
             var started = DateTime.Now;
+            _tickerChan = Channel.CreateUnbounded<DateTime>();
 
-            lock (_locker)
+            Task.Run(async () =>
             {
-                System.Threading.Timer t = new System.Threading.Timer(
-                    delegate
+                while (!TimerContext.Token.IsCancellationRequested)
+                {
+                    await Task.Delay(duration, TimerContext.Token);
+                    if (!TimerContext.Token.IsCancellationRequested)
                     {
-                        Thread.CurrentThread.Name = string.Format("ticker started:{0} duration:{1} tick:{2}",
-                            started, duration, DateTime.Now);
-
-                        lock (_locker)
-                        {
-                            if (_stop)
-                            {
-                                if (_threadingTimer != null)
-                                {
-                                    _threadingTimer.Dispose();
-                                    _threadingTimer = null;
-                                }
-                                return;
-                            }
-
-                            new SelectCase()
-                                .CaseSend(_tickerChan, DateTime.UtcNow)
-                                .Default(null);
-                        }
-
-                    }, null, duration, duration);
-
-                _threadingTimer = t;
-            }
+                        _tickerChan.Writer.TryWrite(DateTime.UtcNow);
+                    }
+                }
+            }, token);
         }
 
         /// <summary>
@@ -62,36 +46,14 @@ namespace NsqSharp.Utils
         /// </summary>
         public void Stop()
         {
-            lock (_locker)
-            {
-                _stop = true;
-                if (_threadingTimer != null)
-                {
-                    _threadingTimer.Dispose();
-                    _threadingTimer = null;
-                }
-            }
+            TimerContext.Cancel();
+            _tickerChan.Writer.Complete();
         }
 
-        /// <summary>
-        /// Stops the ticker and closes the channel, exiting the ticker thread. Note: after closing a channel,
-        /// all reads from the channel will return default(T). See <see cref="Stop"/>.
-        /// </summary>
-        public void Close()
+        public ChannelReader<DateTime> C
         {
-            lock (_locker)
-            {
-                Stop();
-                _tickerChan.Close();
-            }
+            get { return _tickerChan.Reader; }
         }
 
-        /// <summary>
-        /// The channel on which the ticks are delivered.
-        /// </summary>
-        public IReceiveOnlyChan<DateTime> C
-        {
-            get { return _tickerChan; }
-        }
     }
 }

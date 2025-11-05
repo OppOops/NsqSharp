@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Text;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using NsqSharp.Core;
 using NsqSharp.Utils;
@@ -15,7 +16,7 @@ namespace NsqSharp
     /// <summary>
     /// IConn interface
     /// </summary>
-    internal interface IConn
+    internal interface INsqConnection
     {
         /// <summary>
         /// SetLogger assigns the logger to use as well as a level.
@@ -31,7 +32,7 @@ namespace NsqSharp
         /// Connect dials and bootstraps the nsqd connection
         /// (including IDENTIFY) and returns the IdentifyResponse
         /// </summary>
-        IdentifyResponse Connect();
+        IdentifyResponse Connect(Action<INsqCommandWritter> initialHandshake);
 
         /// <summary>
         /// Close idempotently initiates connection close
@@ -61,26 +62,25 @@ namespace NsqSharp
 
         internal long _id;
         private readonly string _addr;
-        private IConn _conn;
+        private INsqConnection _conn;
         private readonly Config _config;
 
         private readonly ILogger _logger;
 
-        private readonly Chan<byte[]> _responseChan;
-        private readonly Chan<byte[]> _errorChan;
-        private Chan<int> _closeChan;
+        private readonly Channel<byte[]> _responseChan;
+        private readonly Channel<byte[]> _errorChan;
 
-        private readonly Chan<ProducerResponse> _transactionChan;
+        private readonly Channel<ProducerResponse> _transactionChan;
         private readonly Queue<ProducerResponse> _transactions = new Queue<ProducerResponse>();
         private int _state;
 
         private int _concurrentProducers;
         private int _stopFlag;
-        private readonly Chan<int> _exitChan;
-        private readonly WaitGroup _wg = new WaitGroup();
-        private readonly object _guard = new object();
 
-        private readonly Func<Producer, IConn> _connFactory;
+        private CancellationTokenSource _exitChanTokenSource = new();
+        private CancellationToken exitToken => _exitChanTokenSource.Token;
+        private readonly SemaphoreSlim _guard = new SemaphoreSlim(1, 1);
+
     }
 
     /// <summary>
@@ -88,25 +88,31 @@ namespace NsqSharp
     /// to retrieve metadata about the command after the
     /// response is received.
     /// </summary>
-    public class ProducerResponse
+    public record ProducerResponse
     {
-        internal Command _cmd;
-        internal Chan<ProducerResponse> _doneChan;
+        internal Command _cmd { get; init; } = Command.Nop();
+        internal TaskCompletionSource<ProducerResponse>? _doneChan { get; init; }
 
         /// <summary>
         /// the error (or nil) of the publish command
         /// </summary>
-        public Exception Error { get; set; }
+        public Exception? Error { get; init; }
 
         /// <summary>
         /// the slice of variadic arguments passed to PublishAsync or MultiPublishAsync
         /// </summary>
-        public object[] Args { get; set; }
+        public object[] Args { get; init; } = Array.Empty<object>();
 
-        internal void finish()
+        internal void SetAsFinished()
         {
-            if (_doneChan != null)
-                _doneChan.Send(this);
+            if(this.Error != null)
+            {
+                _doneChan?.TrySetException(this.Error);
+            }
+            else
+            {
+                _doneChan?.TrySetResult(this);
+            }
         }
     }
 
@@ -158,14 +164,13 @@ namespace NsqSharp
         {
         }
 
-        private Producer(string addr, ILogger logger, Config config, Func<Producer, IConn> connFactory)
+        private Producer(string addr, ILogger logger, Config config, object? _)
         {
             if (string.IsNullOrEmpty(addr))
-                throw new ArgumentNullException("addr");
-            if (logger == null)
-                throw new ArgumentNullException("logger");
-            if (config == null)
-                throw new ArgumentNullException("config");
+                throw new ArgumentNullException(nameof(addr));
+            ArgumentNullException.ThrowIfNull(logger, nameof(logger));
+            ArgumentNullException.ThrowIfNull(config, nameof(config));
+                
 
             _id = Interlocked.Increment(ref _instCount);
 
@@ -176,15 +181,11 @@ namespace NsqSharp
 
             _logger = logger;
 
-            _transactionChan = new Chan<ProducerResponse>();
-            _exitChan = new Chan<int>();
-            _responseChan = new Chan<byte[]>();
-            _errorChan = new Chan<byte[]>();
+            _transactionChan = Channel.CreateUnbounded<ProducerResponse>();
+            _responseChan = Channel.CreateUnbounded<byte[]>();
+            _errorChan = Channel.CreateUnbounded<byte[]>();
 
-            if (connFactory == null)
-                connFactory = p => new Conn(_addr, _config, p);
-
-            _connFactory = connFactory;
+            _conn = new EmptyNsqConnectionHandler();
         }
 
         /// <summary>Returns the address of the Producer.</summary>
@@ -201,20 +202,14 @@ namespace NsqSharp
         /// </summary>
         public void Stop()
         {
-            lock (_guard)
+            if (Interlocked.CompareExchange(ref _stopFlag, value: 1, comparand: 0) != 0)
             {
-                if (Interlocked.CompareExchange(ref _stopFlag, value: 1, comparand: 0) != 0)
-                {
-                    // already closed
-                    return;
-                }
-                log(LogLevel.Info, "stopping");
-                _exitChan.Close();
-                close();
-                _wg.Wait();
-                _logger.Flush();
-                Thread.Sleep(500);
+                // already closed
+                return;
             }
+            log(LogLevel.Info, "stopping");
+            CloseTcpConnection();
+            _logger.Flush();
         }
 
         /// <summary>
@@ -231,11 +226,14 @@ namespace NsqSharp
         ///     <see cref="ProducerResponse.Args"/>.
         /// </param>
         /// <returns>A Task&lt;ProducerResponse&gt; which can be awaited.</returns>
-        public Task<ProducerResponse> PublishAsync(string topic, byte[] body, params object[] args)
+        public async Task<ProducerResponse> PublishAsync(string topic, byte[] body, params object[] args)
         {
-            var doneChan = new Chan<ProducerResponse>();
-            sendCommandAsync(Command.Publish(topic, body), doneChan, args);
-            return Task.Factory.StartNew(() => doneChan.Receive());
+            await CheckAndTryConnectAsync();
+            var doneChan = new TaskCompletionSource<ProducerResponse>();
+            SendCommandToChannel(Command.Publish(topic, body), 
+                doneChan, 
+                args);
+            return await doneChan.Task;
         }
 
         /// <summary>
@@ -271,12 +269,14 @@ namespace NsqSharp
         ///     <see cref="ProducerResponse.Args"/>.
         /// </param>
         /// <returns>A Task&lt;ProducerResponse&gt; which can be awaited.</returns>
-        public Task<ProducerResponse> MultiPublishAsync(string topic, IEnumerable<byte[]> bodies, params object[] args)
+        public async Task<ProducerResponse> MultiPublishAsync(string topic, IEnumerable<byte[]> bodies, params object[] args)
         {
-            var doneChan = new Chan<ProducerResponse>();
-            var cmd = Command.MultiPublish(topic, bodies);
-            sendCommandAsync(cmd, doneChan, args);
-            return Task.Factory.StartNew(() => doneChan.Receive());
+            await CheckAndTryConnectAsync();
+            var doneChan = new TaskCompletionSource<ProducerResponse>();
+            SendCommandToChannel(Command.MultiPublish(topic, bodies), 
+                doneChan, 
+                args);
+            return await doneChan.Task;
         }
 
         /// <summary>
@@ -285,9 +285,14 @@ namespace NsqSharp
         /// </summary>
         /// <param name="topic">The topic to publish to.</param>
         /// <param name="body">The message body.</param>
-        public void Publish(string topic, byte[] body)
+        public void Publish(string topic, byte[] body, bool fireAndForgot = true)
         {
-            sendCommand(Command.Publish(topic, body));
+            if(!fireAndForgot)
+                SendCommandWait(Command.Publish(topic, body));
+            else
+            {
+                SendCommandNoWait(Command.Publish(topic, body));
+            }
         }
 
         /// <summary>
@@ -307,75 +312,71 @@ namespace NsqSharp
         /// </summary>
         /// <param name="topic">The topic to publish to.</param>
         /// <param name="bodies">The collection of message bodies.</param>
-        public void MultiPublish(string topic, IEnumerable<byte[]> bodies)
+        public void MultiPublish(string topic, IEnumerable<byte[]> bodies, bool fireAndForgot = true)
         {
             var cmd = Command.MultiPublish(topic, bodies);
-            sendCommand(cmd);
+            if (!fireAndForgot)
+                SendCommandWait(cmd);
+            else
+            {
+                SendCommandNoWait(cmd);
+            }
+        }
+        private void CheckAndTryConnectSync()
+        {
+            if (_state != (int)State.Connected)
+            {
+                var task = Connect();
+                task.ConfigureAwait(false).GetAwaiter().GetResult();
+            }
         }
 
-        private void sendCommand(Command cmd)
+        private async Task CheckAndTryConnectAsync()
         {
-            var doneChan = new Chan<ProducerResponse>();
-
-            try
-            {
-                sendCommandAsync(cmd, doneChan);
-            }
-            catch (Exception)
-            {
-                doneChan.Close();
-                throw;
-            }
-
-            var t = doneChan.Receive();
-            if (t.Error != null)
-                throw t.Error;
+            if (_state != (int)State.Connected)
+                await Connect();
         }
 
-        private readonly Action<int> _throwErrStoppedAction = b => { throw new ErrStopped(); };
-
-        private void sendCommandAsync(Command cmd, Chan<ProducerResponse> doneChan, params object[] args)
+        private void SendCommandWait(Command cmd)
         {
-            ProducerResponse t = null;
+            var doneChan = new TaskCompletionSource<ProducerResponse>();
             try
             {
-                if (_state != (int)State.Connected)
-                {
-                    Connect();
-                }
-
-                // keep track of how many outstanding producers we're dealing with
-                // in order to later ensure that we clean them all up...
-                Interlocked.Increment(ref _concurrentProducers);
-
-                t = new ProducerResponse
-                {
-                    _cmd = cmd,
-                    _doneChan = doneChan,
-                    Args = args
-                };
-
-                Select
-                    .CaseSend(_transactionChan, t)
-                    .CaseReceive(_exitChan, _throwErrStoppedAction)
-                    .NoDefault();
-
-                Interlocked.Decrement(ref _concurrentProducers);
+                CheckAndTryConnectSync();
+                SendCommandToChannel(cmd, doneChan);
             }
             catch (Exception ex)
             {
-                if (t != null)
-                {
-                    Interlocked.Decrement(ref _concurrentProducers);
-                    t.Error = ex;
-                    GoFunc.Run(() => t.finish(), "Producer: t.finish()");
-                }
-                else
-                {
-                    Thread.Sleep(1000); // slow down hammering Connect
-                    throw;
-                }
+                doneChan.TrySetException(ex);
+                throw;
             }
+
+            doneChan.Task.Wait();
+        }
+
+        private void SendCommandNoWait(Command cmd)
+        {
+            CheckAndTryConnectSync();
+            SendCommandToChannel(cmd, null);
+        }
+
+        private void SendCommandToChannel(Command cmd, 
+            TaskCompletionSource<ProducerResponse>? doneChan, 
+            params object[] args)
+        {
+            ProducerResponse? t = null;
+            Interlocked.Increment(ref _concurrentProducers);
+
+            t = new ProducerResponse
+            {
+                _cmd = cmd,
+                _doneChan = doneChan,
+                Args = args
+            };
+
+            _transactionChan.Writer.TryWrite(t);
+
+            Interlocked.Decrement(ref _concurrentProducers);
         }
 
         /// <summary>
@@ -384,10 +385,11 @@ namespace NsqSharp
         /// </summary>
         /// <exception cref="ErrStopped">Thrown if the Producer has been stopped.</exception>
         /// <exception cref="ErrNotConnected">Thrown if the Producer is currently waiting to close and reconnect.</exception>
-        public void Connect()
+        public async Task Connect()
         {
-            lock (_guard)
+            try
             {
+                await _guard.WaitAsync();
                 if (_stopFlag == 1)
                     throw new ErrStopped();
 
@@ -403,11 +405,13 @@ namespace NsqSharp
 
                 log(LogLevel.Info, string.Format("{0} connecting to nsqd", _addr));
 
-                _conn = _connFactory(this);
-                _conn.SetLogger(_logger, string.Format("P{0} ({{0}})", _id));
+                var builder = new NsqConnectionBuilder(_addr, _config, this);
+                builder.SetLogger(_logger, string.Format("P{0} ({{0}})", _id));
                 try
                 {
-                    _conn.Connect();
+                    await builder.Dial();
+                    builder.HandShake(_ => { });
+                    _conn = builder.GetRuntimeConnection();
                 }
                 catch (Exception ex)
                 {
@@ -417,78 +421,61 @@ namespace NsqSharp
                 }
 
                 _state = (int)State.Connected;
-                _closeChan = new Chan<int>();
-                _wg.Add(1);
                 log(LogLevel.Info, string.Format("{0} connected to nsqd", _addr));
-                GoFunc.Run(router, string.Format("Producer:router P{0}", _id));
+                _ = StartProducer(this.exitToken); // Background process
+            }
+            finally
+            {
+                _guard.Release();
             }
         }
 
-        private void close()
+        private void CloseTcpConnection()
         {
+            // no need to lock, user must ensure stop and connect are not called concurrently
             const int newValue = (int)State.Disconnected;
             const int comparand = (int)State.Connected;
             if (Interlocked.CompareExchange(ref _state, newValue, comparand) != comparand)
             {
                 return;
             }
+            _exitChanTokenSource.Cancel(); // notify stop for sending to nsqd
+            _exitChanTokenSource = new CancellationTokenSource(); // recreate for next connection context
 
             _conn.Close();
-
-            GoFunc.Run(() =>
-            {
-                // we need to handle this in a goroutine so we don't
-                // block the caller from making progress
-                _wg.Wait();
-                _state = (int)State.Init;
-            }, string.Format("Producer:close P{0}", _id));
+            //wait
+            _state = (int)State.Init;
         }
 
-        private void router()
+        private async Task StartProducer(CancellationToken exitToken)
         {
-            bool doLoop = true;
-
-            using (var select =
-                Select
-                    .CaseReceive(_transactionChan, t =>
-                    {
-                        _transactions.Enqueue(t);
-                        try
-                        {
-                            _conn.WriteCommand(t._cmd);
-                        }
-                        catch (Exception ex)
-                        {
-                            log(LogLevel.Error, string.Format("({0}) sending command - {1}", _conn, ex.Message));
-                            close();
-                        }
-                    })
-                    .CaseReceive(_responseChan, data =>
-                        popTransaction(FrameType.Response, data)
-                    )
-                    .CaseReceive(_errorChan, data =>
-                        popTransaction(FrameType.Error, data)
-                    )
-                    .CaseReceive(_closeChan, o =>
-                    {
-                        doLoop = false;
-                    })
-                    .CaseReceive(_exitChan, o =>
-                    {
-                        doLoop = false;
-                    })
-                    .NoDefault(defer: true))
+            try
             {
-                // ReSharper disable once LoopVariableIsNeverChangedInsideLoop
-                while (doLoop)
+                var select = Select
+                .CaseReceive(_transactionChan, t =>
                 {
-                    select.Execute();
+                    _transactions.Enqueue(t);
+                    if(this._state != (int)State.Connected)
+                        return;
+                    _conn.WriteCommand(t._cmd); // no need to handle send failure, OnIOError will be called
+                })
+                .CaseReceive(_responseChan, data =>
+                    popTransaction(FrameType.Response, data)
+                )
+                .CaseReceive(_errorChan, data =>
+                    popTransaction(FrameType.Error, data)
+                );
+
+                while (!exitToken.IsCancellationRequested)
+                {
+                    await select.ExecuteAsync(exitToken);
                 }
             }
-
-            transactionCleanup();
-            _wg.Done();
-            log(LogLevel.Info, "exiting router");
+            finally
+            {
+                transactionCleanup();
+                log(LogLevel.Info, "exiting producer router");
+            }
         }
 
         private void popTransaction(FrameType frameType, byte[] data)
@@ -496,69 +483,26 @@ namespace NsqSharp
             var t = _transactions.Dequeue();
             if (frameType == FrameType.Error)
             {
-                t.Error = new ErrProtocol(Encoding.UTF8.GetString(data));
+                t = t with { Error = new ErrProtocol(Encoding.UTF8.GetString(data)) };
             }
-            t.finish();
+            t.SetAsFinished();
         }
 
         private void transactionCleanup()
         {
             // clean up transactions we can easily account for
-            var wg = new WaitGroup();
-            wg.Add(_transactions.Count);
             foreach (var t in _transactions)
             {
-                var t1 = t;
-                GoFunc.Run(() =>
-                           {
-                               t1.Error = new ErrNotConnected();
-                               t1.finish();
-                               wg.Done();
-                           }, "transactionCleanup: drain _transactions");
+                var t1 = t with { Error = new ErrNotConnected() }; ;
+                t.SetAsFinished();
             }
             _transactions.Clear();
 
-            // spin and free up any writes that might have raced
-            // with the cleanup process (blocked on writing
-            // to transactionChan)
-
-            // give the runtime a chance to schedule other racing goroutines
-            var ticker = new Ticker(TimeSpan.FromMilliseconds(100));
-            bool doLoop = true;
-            using (var select =
-                    Select
-                    .CaseReceive(_transactionChan, t =>
-                    {
-                        wg.Add(1);
-                        GoFunc.Run(() =>
-                                   {
-                                       t.Error = new ErrNotConnected();
-                                       t.finish();
-                                       wg.Done();
-                                   }, "transactionCleanup: finish transaction from _transactionChan");
-                    })
-                    .CaseReceive(ticker.C, _ =>
-                    {
-                        // keep spinning until there are 0 concurrent producers
-                        if (_concurrentProducers == 0)
-                        {
-                            doLoop = false;
-                            return;
-                        }
-                        log(LogLevel.Warning, string.Format(
-                            "waiting for {0} concurrent producers to finish", _concurrentProducers));
-                    })
-                    .NoDefault(defer: true)
-            )
+            while(_transactionChan.Reader.TryRead(out var t2))
             {
-                while (doLoop)
-                {
-                    select.Execute();
-                }
+                var t3 = t2 with { Error = new ErrNotConnected() }; ;
+                t2.SetAsFinished();
             }
-            ticker.Close();
-
-            wg.Wait();
         }
 
         private void log(LogLevel lvl, string line)
@@ -567,35 +511,35 @@ namespace NsqSharp
             _logger.Output(lvl, string.Format("P{0} {1}", _id, line));
         }
 
-        void IConnDelegate.OnResponse(Conn c, byte[] data)
+        void IConnDelegate.OnResponse(NsqContext c, byte[] data)
         {
-            _responseChan.Send(data);
+            _responseChan.Writer.TryWrite(data);
         }
 
-        void IConnDelegate.OnError(Conn c, byte[] data)
+        void IConnDelegate.OnError(NsqContext c, byte[] data)
         {
-            _errorChan.Send(data);
+            _errorChan.Writer.TryWrite(data);
         }
 
-        void IConnDelegate.OnIOError(Conn c, Exception err)
+        void IConnDelegate.OnIOError(NsqContext c, Exception err)
         {
-            close();
+            CloseTcpConnection();
         }
 
-        void IConnDelegate.OnClose(Conn c)
+        void IConnDelegate.OnClose(NsqContext c)
         {
-            lock (_guard)
-            {
-                _closeChan.Close();
-            }
+            _transactionChan.Writer.Complete();
+            _errorChan.Writer.Complete();
+            _responseChan.Writer.Complete();
+            _exitChanTokenSource.Cancel();
         }
 
-        void IConnDelegate.OnMessage(Conn c, Message m) { }
-        void IConnDelegate.OnMessageFinished(Conn c, Message m) { }
-        void IConnDelegate.OnMessageRequeued(Conn c, Message m) { }
-        void IConnDelegate.OnBackoff(Conn c) { }
-        void IConnDelegate.OnContinue(Conn c) { }
-        void IConnDelegate.OnResume(Conn c) { }
-        void IConnDelegate.OnHeartbeat(Conn c) { }
+        void IConnDelegate.OnMessage(NsqContext c, Message m) { }
+        void IConnDelegate.OnMessageFinished(NsqContext c, Message m) { }
+        void IConnDelegate.OnMessageRequeued(NsqContext c, Message m) { }
+        void IConnDelegate.OnBackoff(NsqContext c) { }
+        void IConnDelegate.OnContinue(NsqContext c) { }
+        void IConnDelegate.OnResume(NsqContext c) { }
+        void IConnDelegate.OnHeartbeat(NsqContext c) { }
     }
 }

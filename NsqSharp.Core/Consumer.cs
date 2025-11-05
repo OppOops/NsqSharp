@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
@@ -6,6 +7,7 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using NsqSharp.Api;
 using NsqSharp.Core;
@@ -13,10 +15,23 @@ using NsqSharp.Utils;
 using NsqSharp.Utils.Channels;
 using NsqSharp.Utils.Extensions;
 using NsqSharp.Utils.Loggers;
-using Timer = NsqSharp.Utils.Timer;
 
 namespace NsqSharp
 {
+    /// <summary>
+    ///     <para>Message processing logging interface for <see cref="Consumer" /> when failure (when the attempts exceed configuration).</para>
+    ///     <para>When an exception is thrown the <see cref="Consumer"/> will automatically handle REQ'ing the message.</para>
+    /// </summary>
+
+    public interface IMessageFailedLogger
+    {  /// <summary>
+       ///     Called when a <see cref="Message"/> has exceeded the <see cref="Consumer"/> specified
+       ///     <see cref="Config.MaxAttempts"/>.
+       /// </summary>
+       /// <param name="message">The failed message.</param>
+        void LogFailedMessage(IMessage message);
+    }
+
     /// <summary>
     ///     <para>Message processing interface for <see cref="Consumer" />.</para>
     ///     <para>When the <see cref="HandleMessage"/> method returns the <see cref="Consumer"/> will automatically handle
@@ -24,18 +39,19 @@ namespace NsqSharp
     ///     <para>When an exception is thrown the <see cref="Consumer"/> will automatically handle REQ'ing the message.</para>
     /// </summary>
     /// <seealso cref="Consumer.AddHandler"/>
-    public interface IHandler
+    public interface IHandler : IMessageFailedLogger
     {
         /// <summary>Handles a message.</summary>
         /// <param name="message">The message.</param>
         void HandleMessage(IMessage message);
+    }
 
-        /// <summary>
-        ///     Called when a <see cref="Message"/> has exceeded the <see cref="Consumer"/> specified
-        ///     <see cref="Config.MaxAttempts"/>.
-        /// </summary>
-        /// <param name="message">The failed message.</param>
-        void LogFailedMessage(IMessage message);
+    public interface IAsyncHandler : IMessageFailedLogger
+    {
+        /// <summary>Handles a message asynchronously.</summary>
+        /// <param name="message">The message.</param>
+        /// <returns>A task representing the asynchronous operation.</returns>
+        Task HandleMessageAsync(IMessage message);
     }
 
     /// <summary>
@@ -139,7 +155,7 @@ namespace NsqSharp
     /// <seealso cref="ConnectToNsqd"/>
     /// <seealso cref="ConnectToNsqLookupd"/>
     /// <seealso cref="Stop()"/>
-    public sealed class Consumer : IConnDelegate
+    public sealed partial class Consumer : IConnDelegate
     {
         private static readonly byte[] CLOSE_WAIT_BYTES = Encoding.UTF8.GetBytes("CLOSE_WAIT");
 
@@ -165,28 +181,26 @@ namespace NsqSharp
         private readonly string _channel;
         private readonly Config _config;
 
-        private readonly RNGCryptoServiceProvider _rng; // TODO: Dispose (don't make static, uses critical section internally)
 
         private int _needRdyRedistributed;
 
         private readonly ReaderWriterLockSlim _backoffMtx = new ReaderWriterLockSlim(); // TODO: Dispose
 
-        private readonly Chan<Message> _incomingMessages;
+        private readonly Channel<Message> _incomingMessages;
 
         private readonly ReaderWriterLockSlim _rdyRetryMtx = new ReaderWriterLockSlim(); // TODO: Dispose
-        private readonly Dictionary<string, Timer> _rdyRetryTimers;
+        private readonly ConcurrentDictionary<string, CancellationTokenSource> _rdyRetryTimers;
 
-        private readonly Dictionary<string, Conn> _pendingConnections;
-        private readonly Dictionary<string, Conn> _connections;
+        private readonly ConcurrentDictionary<string, CancellationTokenSource> _pendingConnections;
+        private readonly ConcurrentDictionary<string, NsqContext> _connections;
 
         private readonly List<string> _nsqdTCPAddrs = new List<string>();
 
         // used at connection close to force a possible reconnect
-        private readonly Chan<int> _lookupdRecheckChan;
+        private readonly Channel<int> _lookupdRecheckChan;
         private readonly List<string> _lookupdHTTPAddrs = new List<string>();
         private int _lookupdQueryIndex;
 
-        private readonly WaitGroup _wg = new WaitGroup();
         private int _runningHandlers;
         private int _stopFlag;
         private int _connectedFlag;
@@ -194,8 +208,7 @@ namespace NsqSharp
         private readonly Once _exitHandler = new Once();
 
         // read from this channel to block until consumer is cleanly stopped
-        private readonly Chan<int> _stopChan;
-        private readonly Chan<int> _exitChan;
+        private readonly CancellationTokenSource ConsumerStopContext = new();
 
         /// <summary>
         ///     <para>Creates a new instance of <see cref="Consumer"/> for the specified <paramref name="topic"/> and
@@ -279,25 +292,16 @@ namespace NsqSharp
         public Consumer(string topic, string channel, ILogger logger, Config config)
         {
             if (string.IsNullOrEmpty(topic))
-                throw new ArgumentNullException("topic");
+                throw new ArgumentNullException(nameof(topic));
             if (string.IsNullOrEmpty(channel))
-                throw new ArgumentNullException("channel");
-            if (config == null)
-                throw new ArgumentNullException("config");
-            if (logger == null)
-                throw new ArgumentNullException("logger");
-
+                throw new ArgumentNullException(nameof(channel));
             config.Validate();
 
             if (!Protocol.IsValidTopicName(topic))
-            {
-                throw new ArgumentException("invalid topic name", "topic");
-            }
+                throw new ArgumentException("invalid topic name", nameof(topic));
 
             if (!Protocol.IsValidChannelName(channel))
-            {
-                throw new ArgumentException("invalid channel name", "channel");
-            }
+                throw new ArgumentException("invalid channel name", nameof(channel));
 
             _id = Interlocked.Increment(ref _instCount);
 
@@ -308,22 +312,15 @@ namespace NsqSharp
 
             _maxInFlight = config.MaxInFlight;
 
-            _incomingMessages = new Chan<Message>();
+            _incomingMessages = Channel.CreateUnbounded<Message>();
 
-            _rdyRetryTimers = new Dictionary<string, Timer>();
-            _pendingConnections = new Dictionary<string, Conn>();
-            _connections = new Dictionary<string, Conn>();
+            _rdyRetryTimers = new();
+            _pendingConnections = new();
+            _connections = new();
 
-            _lookupdRecheckChan = new Chan<int>(bufferSize: 1);
+            _lookupdRecheckChan = Channel.CreateBounded<int>(1);
 
-            _rng = new RNGCryptoServiceProvider();
-
-            _stopChan = new Chan<int>();
-            _exitChan = new Chan<int>();
-
-            _wg.Add(1);
-
-            GoFunc.Run(rdyLoop, string.Format("rdyLoop: {0}/{1}", _topic, _channel));
+            _ = RunRdyLoop(this.ConsumerStopContext.Token);
         }
 
         /// <summary>
@@ -337,16 +334,16 @@ namespace NsqSharp
                 MessagesReceived = _messagesReceived,
                 MessagesFinished = _messagesFinished,
                 MessagesRequeued = _messagesRequeued,
-                Connections = conns().Count
+                Connections = GetCurrentConnections().Count
             };
         }
 
-        private List<Conn> conns()
+        private List<NsqContext> GetCurrentConnections()
         {
             _mtx.EnterReadLock();
             try
             {
-                return new List<Conn>(_connections.Values);
+                return new List<NsqContext>(_connections.Values);
             }
             finally
             {
@@ -377,7 +374,7 @@ namespace NsqSharp
             if (_perConnMaxInFlightOverride == 0)
             {
                 long b = getMaxInFlight();
-                int connCount = conns().Count;
+                int connCount = GetCurrentConnections().Count;
                 long s = (connCount == 0 ? 1 : b / connCount);
                 return Math.Min(Math.Max(1, s), b);
             }
@@ -396,13 +393,13 @@ namespace NsqSharp
         {
             get
             {
-                foreach (var conn in conns())
+                foreach (var conn in GetCurrentConnections())
                 {
                     // TODO: if in backoff, would IsStarved return true? what's the impact?
                     // TODO: go-nsq PR, use conn.LastRDY() which does the atomic load for us
                     long threshold = (long)(conn.LastRDY * 0.85);
                     long inFlight = conn._messagesInFlight;
-                    if (inFlight >= threshold && inFlight > 0 && !conn.IsClosing)
+                    if (inFlight >= threshold && inFlight > 0)
                     {
                         return true;
                     }
@@ -432,7 +429,7 @@ namespace NsqSharp
 
             _maxInFlight = maxInFlight;
 
-            foreach (var c in conns())
+            foreach (var c in GetCurrentConnections())
             {
                 maybeUpdateRDY(c);
             }
@@ -449,111 +446,89 @@ namespace NsqSharp
         /// <exception cref="ArgumentException">Thrown when <paramref name="addresses"/> is empty.
         /// </exception>
         /// <param name="addresses">The nsqlookupd address(es) to add.</param>
-        /// <seealso cref="DisconnectFromNsqLookupd"/>
         /// <seealso cref="ConnectToNsqd"/>
         public void ConnectToNsqLookupd(params string[] addresses)
         {
-            if (addresses == null)
-                throw new ArgumentNullException("addresses");
             if (addresses.Length == 0)
-                throw new ArgumentException("addresses.Length = 0", "addresses");
-
-            foreach (string address in addresses)
-            {
-                connectToNsqLookupd(address);
-            }
-        }
-
-        private void connectToNsqLookupd(string address)
-        {
-            if (string.IsNullOrEmpty(address))
-                throw new ArgumentNullException("address");
-
+                throw new ArgumentException("addresses.Length = 0", nameof(addresses));
+            addresses = addresses.Distinct().ToArray();
+            if (_lookupdHTTPAddrs.Count > 0)
+                throw new InvalidOperationException("cannot modify lookupd address at runtime");
             if (_stopFlag == 1)
                 throw new Exception("consumer stopped");
             if (_runningHandlers == 0)
                 throw new Exception("no handlers");
 
-            validatedLookupAddr(address);
+            foreach (var address in addresses)
+            {
+                if(!ValidatedLookupdAddress(address, out string? error))
+                {
+                    throw new ArgumentException($"invalid lookupd address '{address}': {error}", nameof(addresses));
+                }
+            }
 
-            _connectedFlag = 1;
-
-            int numLookupd;
-            _mtx.EnterWriteLock();
             try
             {
-                foreach (var x in _lookupdHTTPAddrs)
-                {
-                    if (x == address)
-                        return;
-                }
-
-                _lookupdHTTPAddrs.Add(address);
-                numLookupd = _lookupdHTTPAddrs.Count;
+                _mtx.EnterWriteLock();
+                _lookupdHTTPAddrs.AddRange(addresses);
             }
             finally
             {
                 _mtx.ExitWriteLock();
             }
-
-            // if this is the first one, kick off the go loop
-            if (numLookupd == 1)
-            {
-                queryLookupd();
-                _wg.Add(1);
-                GoFunc.Run(lookupdLoop, string.Format("lookupdLoop: {0}/{1}", _topic, _channel));
-            }
+            queryLookupd();
+            _connectedFlag = 1;
+            _ = RunLookupdLoop(this.ConsumerStopContext.Token);
         }
 
-        private void validatedLookupAddr(string address)
+        private static bool ValidatedLookupdAddress(string address, out string? error)
         {
+            error = null;
             if (string.IsNullOrEmpty(address))
-                throw new ArgumentNullException("address");
-
-            if (address.Contains("/"))
+            {
+                error = "empty address";
+                return false;
+            }
+            if (!address.Contains(':'))
+            {
+                error = "address missing port";
+                return false;
+            }
+            if (address.Contains('/'))
             {
                 // TODO: verify this is the kind of validation we want
-                new Uri(address, UriKind.Absolute);
+                try
+                {
+                    _ = new Uri(address, UriKind.Absolute);
+                }
+                catch(Exception ex)
+                {
+                    error = $"invalid address format: {ex.Message}";
+                    return false;
+                }
             }
-            if (!address.Contains(":"))
-                throw new Exception("missing port");
+            return true;
         }
 
         /// <summary>
         /// poll all known lookup servers every LookupdPollInterval
         /// </summary>
-        private void lookupdLoop()
+        private async Task RunLookupdLoop(CancellationToken token)
         {
             // add some jitter so that multiple consumers discovering the same topic,
             // when restarted at the same time, dont all connect at once.
-            var jitter = new TimeSpan((long)(_rng.Float64() * _config.LookupdPollJitter * _config.LookupdPollInterval.Ticks));
+            var jitter = new TimeSpan((long)(Random.Shared.NextDouble() * _config.LookupdPollJitter * _config.LookupdPollInterval.Ticks));
+            await Task.Delay(jitter, token);
 
-            bool doLoop = true;
-
-            Select
-                .CaseReceive(Time.After(jitter))
-                .CaseReceive(_exitChan, o => doLoop = false)
-                .NoDefault();
-
-            var ticker = new Ticker(_config.LookupdPollInterval);
-
-            using (var select =
-                    Select
+            var ticker = new Ticker(_config.LookupdPollInterval, token);
+            var select = Select
                         .CaseReceive(ticker.C, o => queryLookupd())
-                        .CaseReceive(_lookupdRecheckChan, o => queryLookupd())
-                        .CaseReceive(_exitChan, o => doLoop = false)
-                        .NoDefault(defer: true))
+                        .CaseReceive(_lookupdRecheckChan, o => queryLookupd());
+            while (!token.IsCancellationRequested)
             {
-                // ReSharper disable once LoopVariableIsNeverChangedInsideLoop
-                while (doLoop)
-                {
-                    select.Execute();
-                }
+                await select.ExecuteAsync(token);
             }
-
-            ticker.Stop();
             log(LogLevel.Info, "exiting lookupdLoop");
-            _wg.Done();
         }
 
         /// <summary>
@@ -704,7 +679,7 @@ namespace NsqSharp
         private void connectToNsqd(string addr)
         {
             if (string.IsNullOrEmpty(addr))
-                throw new ArgumentNullException("addr");
+                throw new ArgumentNullException(nameof(addr));
 
             if (_stopFlag == 1)
             {
@@ -718,10 +693,7 @@ namespace NsqSharp
 
             _connectedFlag = 1;
 
-            var conn = new Conn(addr, _config, this);
-            // TODO: Check log format
-            conn.SetLogger(_logger, string.Format("C{0} [{1}/{2}] ({{0}})", _id, _topic, _channel));
-
+            var cts = new CancellationTokenSource();
             _mtx.EnterWriteLock();
             try
             {
@@ -729,9 +701,10 @@ namespace NsqSharp
                 bool ok = _connections.ContainsKey(addr);
                 if (pendingOk || ok)
                 {
+                    cts.Dispose();
                     return;
                 }
-                _pendingConnections[addr] = conn;
+                _pendingConnections[addr] = cts;
                 if (!_nsqdTCPAddrs.Contains(addr))
                     _nsqdTCPAddrs.Add(addr);
             }
@@ -741,24 +714,36 @@ namespace NsqSharp
             }
 
             log(LogLevel.Info, string.Format("({0}) connecting to nsqd", addr));
-
+            var nsqConnectionBuilder = new NsqConnectionBuilder(addr, _config, this);
+            // TODO: Check log format
+            nsqConnectionBuilder.SetLogger(_logger, string.Format("C{0} [{1}/{2}] ({{0}})", _id, _topic, _channel));
             var cleanupConnection = new Action(() =>
             {
                 _mtx.EnterWriteLock();
                 try
                 {
-                    _pendingConnections.Remove(addr);
+                    _pendingConnections.TryRemove(addr, out _);
                 }
                 finally
                 {
                     _mtx.ExitWriteLock();
+                    cts.Cancel();
                 }
             });
 
             IdentifyResponse resp;
+            NsqContext nsqConnectionContext;
             try
             {
-                resp = conn.Connect();
+                nsqConnectionBuilder.Dial(cts.Token)
+                    .ConfigureAwait(false)
+                    .GetAwaiter()
+                    .GetResult();
+                resp = nsqConnectionBuilder.HandShake(cmdWriter =>
+                {
+                    cmdWriter.WriteCommand(Command.Subscribe(_topic, _channel));
+                });
+                nsqConnectionContext = nsqConnectionBuilder.GetNsqContext();
             }
             catch (Exception)
             {
@@ -772,28 +757,16 @@ namespace NsqSharp
                 {
                     log(LogLevel.Warning, string.Format(
                         "({0}) max RDY count {1} < consumer max in flight {2}, truncation possible",
-                        conn, resp.MaxRdyCount, getMaxInFlight()));
+                        nsqConnectionContext, resp.MaxRdyCount, getMaxInFlight()));
                 }
             }
 
-            var cmd = Command.Subscribe(_topic, _channel);
-
-            try
-            {
-                conn.WriteCommand(cmd);
-            }
-            catch (Exception ex)
-            {
-                cleanupConnection();
-                throw new Exception(string.Format("[{0}] failed to subscribe to {1}:{2} - {3}",
-                    conn, _topic, _channel, ex));
-            }
 
             _mtx.EnterWriteLock();
             try
             {
-                _pendingConnections.Remove(addr);
-                _connections[addr] = conn;
+                _pendingConnections.TryRemove(addr, out _);
+                _connections[addr] = nsqConnectionContext;
             }
             finally
             {
@@ -804,7 +777,7 @@ namespace NsqSharp
 
             // pre-emptive signal to existing connections to lower their RDY count
             _perConnMaxInFlightOverride = 0;
-            foreach (var c in conns())
+            foreach (var c in GetCurrentConnections())
             {
                 maybeUpdateRDY(c);
             }
@@ -834,16 +807,13 @@ namespace NsqSharp
                 _nsqdTCPAddrs.RemoveAt(idx);
 
                 // TODO: PR go-nsq remove from connections/pendingConnections
-                Conn pendingConn, conn;
-                if (_connections.TryGetValue(nsqdAddress, out conn))
+                if (_connections.TryRemove(nsqdAddress, out var conn))
                 {
-                    _connections.Remove(nsqdAddress);
                     conn.Close();
                 }
-                else if (_pendingConnections.TryGetValue(nsqdAddress, out pendingConn))
+                else if (_pendingConnections.TryRemove(nsqdAddress, out var pendingConn))
                 {
-                    _pendingConnections.Remove(nsqdAddress);
-                    pendingConn.Close();
+                    pendingConn.Cancel();
                 }
             }
             finally
@@ -852,76 +822,40 @@ namespace NsqSharp
             }
         }
 
-        /// <summary>
-        ///     Removes the specified <paramref name="nsqlookupdAddress"/> from the list used for periodic discovery.
-        /// </summary>
-        /// <exception cref="ArgumentNullException">Thrown when <paramref name="nsqlookupdAddress"/> is <c>null</c>.
-        /// </exception>
-        /// <exception cref="ErrNotConnected">Thrown when the specified <paramref name="nsqlookupdAddress"/> is not in the list
-        ///     of current nsqlookupd addresses.
-        /// </exception>
-        /// <exception cref="Exception">Thrown when the <paramref name="nsqlookupdAddress"/> is the last nsqlookupd in the
-        ///     list.
-        /// </exception>
-        /// <param name="nsqlookupdAddress">The nsqlookupd address to remove.</param>
-        /// <seealso cref="ConnectToNsqLookupd"/>
-        public void DisconnectFromNsqLookupd(string nsqlookupdAddress)
-        {
-            if (string.IsNullOrEmpty(nsqlookupdAddress))
-                throw new ArgumentNullException("nsqlookupdAddress");
-
-            _mtx.EnterWriteLock();
-            try
-            {
-                if (!_lookupdHTTPAddrs.Contains(nsqlookupdAddress))
-                    throw new ErrNotConnected();
-
-                if (_lookupdHTTPAddrs.Count == 1)
-                    throw new Exception(string.Format(
-                        "cannot disconnect from only remaining nsqlookupd HTTP address {0}", nsqlookupdAddress));
-
-                _lookupdHTTPAddrs.Remove(nsqlookupdAddress);
-            }
-            finally
-            {
-                _mtx.ExitWriteLock();
-            }
-        }
-
-        void IConnDelegate.OnMessage(Conn c, Message msg)
+        void IConnDelegate.OnMessage(NsqContext c, Message msg)
         {
             Interlocked.Decrement(ref _totalRdyCount);
             Interlocked.Increment(ref _messagesReceived);
-            _incomingMessages.Send(msg);
+            _incomingMessages.Writer.TryWrite(msg);
             maybeUpdateRDY(c);
         }
 
-        void IConnDelegate.OnMessageFinished(Conn c, Message msg)
+        void IConnDelegate.OnMessageFinished(NsqContext c, Message msg)
         {
             Interlocked.Increment(ref _messagesFinished);
         }
 
-        void IConnDelegate.OnMessageRequeued(Conn c, Message msg)
+        void IConnDelegate.OnMessageRequeued(NsqContext c, Message msg)
         {
             Interlocked.Increment(ref _messagesRequeued);
         }
 
-        void IConnDelegate.OnBackoff(Conn c)
+        void IConnDelegate.OnBackoff(NsqContext c)
         {
             startStopContinueBackoff(BackoffSignal.BackoffFlag);
         }
 
-        void IConnDelegate.OnContinue(Conn c)
+        void IConnDelegate.OnContinue(NsqContext c)
         {
             startStopContinueBackoff(BackoffSignal.ContinueFlag);
         }
 
-        void IConnDelegate.OnResume(Conn c)
+        void IConnDelegate.OnResume(NsqContext c)
         {
             startStopContinueBackoff(BackoffSignal.ResumeFlag);
         }
 
-        void IConnDelegate.OnResponse(Conn c, byte[] data)
+        void IConnDelegate.OnResponse(NsqContext c, byte[] data)
         {
             if (CLOSE_WAIT_BYTES.SequenceEqual(data))
             {
@@ -933,16 +867,16 @@ namespace NsqSharp
             }
         }
 
-        void IConnDelegate.OnError(Conn c, byte[] data) { }
+        void IConnDelegate.OnError(NsqContext c, byte[] data) { }
 
-        void IConnDelegate.OnHeartbeat(Conn c) { }
+        void IConnDelegate.OnHeartbeat(NsqContext c) { }
 
-        void IConnDelegate.OnIOError(Conn c, Exception err)
+        void IConnDelegate.OnIOError(NsqContext c, Exception err)
         {
             c.Close();
         }
 
-        void IConnDelegate.OnClose(Conn c)
+        void IConnDelegate.OnClose(NsqContext c)
         {
             bool hasRDYRetryTimer = false;
 
@@ -955,12 +889,10 @@ namespace NsqSharp
             _rdyRetryMtx.EnterWriteLock();
             try
             {
-                Timer timer;
-                if (_rdyRetryTimers.TryGetValue(connAddr, out timer))
+                if (_rdyRetryTimers.TryRemove(connAddr, out var cts))
                 {
                     // stop any pending retry of an old RDY update
-                    timer.Stop();
-                    _rdyRetryTimers.Remove(connAddr);
+                    cts.Cancel();
                     hasRDYRetryTimer = true;
                 }
             }
@@ -974,7 +906,7 @@ namespace NsqSharp
             _mtx.EnterWriteLock();
             try
             {
-                _connections.Remove(connAddr);
+                _connections.TryRemove(connAddr, out _);
                 left = _connections.Count;
             }
             finally
@@ -1000,7 +932,7 @@ namespace NsqSharp
             {
                 if (left == 0)
                 {
-                    stopHandlers();
+                    StopAcceptIncomingMessage();
                 }
                 return;
             }
@@ -1022,9 +954,7 @@ namespace NsqSharp
             if (numLookupd > 0)
             {
                 // trigger a poll of the lookupd
-                Select
-                    .CaseSend(_lookupdRecheckChan, 1)
-                    .Default(func: null);
+                _lookupdRecheckChan.Writer.TryWrite(1);
             }
             else if (reconnect)
             {
@@ -1112,7 +1042,7 @@ namespace NsqSharp
                     // exit backoff
                     var count = perConnMaxInFlight();
                     log(LogLevel.Warning, string.Format("exiting backoff, return all to RDY {0}", count));
-                    foreach (var c in conns())
+                    foreach (var c in GetCurrentConnections())
                     {
                         updateRDY(c, count);
                     }
@@ -1133,7 +1063,7 @@ namespace NsqSharp
                         ));
 
                     // send RDY 0 immediately (to *all* connections)
-                    foreach (var c in conns())
+                    foreach (var c in GetCurrentConnections())
                     {
                         updateRDY(c, 0);
                     }
@@ -1146,7 +1076,7 @@ namespace NsqSharp
         private void backoff(TimeSpan d)
         {
             _backoffDuration = d.Nanoseconds();
-            Time.AfterFunc(d, resume);
+            Task.Run(async () => { await Task.Delay(d); resume(); });
         }
 
         private void resume()
@@ -1158,7 +1088,7 @@ namespace NsqSharp
             }
 
             // pick a random connection to test the waters
-            var connections = conns();
+            var connections = GetCurrentConnections();
             if (connections.Count == 0)
             {
                 log(LogLevel.Warning, "no connection available to resume");
@@ -1166,7 +1096,7 @@ namespace NsqSharp
                 backoff(TimeSpan.FromSeconds(1));
                 return;
             }
-            var idx = _rng.Intn(connections.Count);
+            var idx = Random.Shared.Next(connections.Count);
             var choice = connections[idx];
 
             log(LogLevel.Warning,
@@ -1196,7 +1126,7 @@ namespace NsqSharp
             return _backoffDuration > 0;
         }
 
-        private void maybeUpdateRDY(Conn conn)
+        private void maybeUpdateRDY(NsqContext conn)
         {
             var isInBackoff = inBackoff();
             var isInBackoffTimeout = inBackoffTimeout();
@@ -1225,36 +1155,22 @@ namespace NsqSharp
             }
         }
 
-        private void rdyLoop()
+        private async Task RunRdyLoop(CancellationToken token)
         {
-            var redistributeTicker = new Ticker(_config.RDYRedistributeInterval);
-
-            bool doLoop = true;
-            using (var select =
-                    Select
-                        .CaseReceive(redistributeTicker.C, o => redistributeRDY())
-                        .CaseReceive(_exitChan, o => doLoop = false)
-                        .NoDefault(defer: true))
+            while (!token.IsCancellationRequested)
             {
-                // ReSharper disable once LoopVariableIsNeverChangedInsideLoop
-                while (doLoop)
-                {
-                    select.Execute();
-                }
+                await Task.Delay(_config.RDYRedistributeInterval, token);
+                redistributeRDY();
             }
-
-            redistributeTicker.Stop();
-            log(LogLevel.Info, "rdyLoop exiting");
-            _wg.Done();
         }
 
-        private Exception updateRDY(Conn c, long count)
+        private Exception updateRDY(NsqContext c, long count)
         {
             try
             {
                 if (c.IsClosing)
                 {
-                    throw new ErrClosing();
+                    return new ErrClosing();
                 }
 
                 // never exceed the nsqd's configured max RDY count
@@ -1267,12 +1183,8 @@ namespace NsqSharp
                 _rdyRetryMtx.EnterWriteLock();
                 try
                 {
-                    Timer timer;
-                    if (_rdyRetryTimers.TryGetValue(connAddr, out timer))
-                    {
-                        timer.Stop();
-                        _rdyRetryTimers.Remove(connAddr);
-                    }
+                    if (_rdyRetryTimers.TryRemove(connAddr, out var cts))
+                        cts.Cancel();
                 }
                 finally
                 {
@@ -1298,8 +1210,13 @@ namespace NsqSharp
                         _rdyRetryMtx.EnterWriteLock();
                         try
                         {
-                            _rdyRetryTimers[connAddr] = Time.AfterFunc(TimeSpan.FromSeconds(5),
-                                () => updateRDY(c, count));
+                            var cts = new CancellationTokenSource();
+                            Task.Run(async () =>
+                            {
+                                await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
+                                updateRDY(c, count);
+                            });
+                            _rdyRetryTimers[connAddr] = cts;
                         }
                         finally
                         {
@@ -1322,7 +1239,7 @@ namespace NsqSharp
             return null;
         }
 
-        private void sendRDY(Conn c, long count)
+        private void sendRDY(NsqContext c, long count)
         {
             if (count == 0 && c.LastRDY == 0)
             {
@@ -1334,7 +1251,7 @@ namespace NsqSharp
             c.SetRDY(count);
             try
             {
-                c.WriteCommand(Command.Ready(count));
+                c.WriteCommandToChannel(Command.Ready(count));
             }
             catch (Exception ex)
             {
@@ -1353,7 +1270,7 @@ namespace NsqSharp
 
             // if an external heuristic set needRDYRedistributed we want to wait
             // until we can actually redistribute to proceed
-            var connections = conns();
+            var connections = GetCurrentConnections();
             if (connections.Count == 0)
             {
                 _perConnMaxInFlightOverride = 0;
@@ -1389,7 +1306,7 @@ namespace NsqSharp
                 return;
             }
 
-            var possibleConns = new List<Conn>();
+            var possibleConns = new List<NsqContext>();
             foreach (var c in connections)
             {
                 var lastMsgDuration = DateTime.Now.Subtract(c.LastMessageTime);
@@ -1413,7 +1330,7 @@ namespace NsqSharp
             while (possibleConns.Count > 0 && availableMaxInFlight > 0)
             {
                 availableMaxInFlight--;
-                int i = _rng.Intn(possibleConns.Count);
+                int i = Random.Shared.Next(possibleConns.Count);
                 var c = possibleConns[i];
                 // delete
                 possibleConns.Remove(c);
@@ -1422,10 +1339,10 @@ namespace NsqSharp
             }
         }
 
-        private void redistributeRDYForIdleConnections(List<Conn> connections, int maxInFlight)
+        private void redistributeRDYForIdleConnections(List<NsqContext> connections, int maxInFlight)
         {
-            var activeConns = new List<Conn>();
-            var idleConns = new List<Conn>();
+            var activeConns = new List<NsqContext>();
+            var idleConns = new List<NsqContext>();
 
             // get idle and active connections
             // idle = RDY > 0 and last message received > LowRdyIdleTimeout
@@ -1490,16 +1407,6 @@ namespace NsqSharp
         }
 
         /// <summary>
-        ///     Wait for the <see cref="Consumer"/> to stop. Usually used when another thread calls <see cref="Stop"/> or
-        ///     <see cref="StopAsync"/>.
-        /// </summary>
-        public void Wait()
-        {
-            bool ok;
-            _stopChan.ReceiveOk(out ok);
-        }
-
-        /// <summary>
         ///     Synchronously initiates a graceful stop of the <see cref="Consumer" /> (permanent) and waits for the stop to
         ///     complete.
         /// </summary>
@@ -1510,57 +1417,29 @@ namespace NsqSharp
 
         /// <summary>Asynchronously initiates a graceful stop of the <see cref="Consumer" /> (permanent).</summary>
         /// <returns>A <see cref="Task"/> which can be awaited for the stop to complete.</returns>
-        public Task StopAsync()
+        public async Task StopAsync()
         {
-            var task = Task.Factory.StartNew(Wait);
-
-            if (Interlocked.CompareExchange(ref _stopFlag, value: 1, comparand: 0) != 0)
-            {
-                return task;
-            }
-
             log(LogLevel.Info, "stopping...");
-
-            var connections = conns();
+            var connections = GetCurrentConnections();
             if (connections.Count == 0)
             {
-                stopHandlers();
+                StopAcceptIncomingMessage();
+                return;
             }
-            else
-            {
-                foreach (var c in connections)
-                {
-                    try
-                    {
-                        c.WriteCommand(Command.StartClose());
-                    }
-                    catch (ConnectionClosedException)
-                    {
-                        // the connection is already closed; this is an acceptable state.
-                    }
-                    catch (Exception ex)
-                    {
-                        log(LogLevel.Error, string.Format("({0}) error sending CLS - {1}", c, ex));
-                    }
-
-                    // if we've waited this long handlers are blocked on processing messages
-                    // so we can't just stopHandlers (if any adtl. messages were pending processing
-                    // we would cause a panic on channel close)
-                    //
-                    // instead, we just bypass handler closing and skip to the final exit
-                    Time.AfterFunc(TimeSpan.FromSeconds(30), exit);
-                }
-            }
-
-            return task;
+            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var cmd = Command.StartClose();
+            var all = Task.WhenAll(
+                connections.Select(c => c.WriteCommandTask(cmd, cts.Token))
+            );
+            await all;
         }
 
-        private void stopHandlers()
+        private void StopAcceptIncomingMessage()
         {
             _stopHandler.Do(() =>
             {
                 log(LogLevel.Info, "stopping handlers");
-                _incomingMessages.Close();
+                _incomingMessages.Writer.Complete();
             });
         }
 
@@ -1626,12 +1505,13 @@ namespace NsqSharp
 
             while (true)
             {
-                bool ok;
-                var message = _incomingMessages.ReceiveOk(out ok);
+                var ok = _incomingMessages.Reader.TryPeek(out var message);
                 if (!ok)
                 {
                     break;
                 }
+                if (message == null)
+                    continue;
 
                 if (shouldFailMessage(message, handler))
                 {
@@ -1660,7 +1540,7 @@ namespace NsqSharp
             log(LogLevel.Debug, "stopping Handler");
             if (Interlocked.Decrement(ref _runningHandlers) == 0)
             {
-                exit();
+                Dispose();
             }
         }
 
@@ -1686,13 +1566,11 @@ namespace NsqSharp
             return false;
         }
 
-        private void exit()
+        private void Dispose()
         {
             _exitHandler.Do(() =>
             {
-                _exitChan.Close();
-                _wg.Wait();
-                _stopChan.Close();
+                this.ConsumerStopContext.Cancel();
                 _logger.Flush();
             });
         }

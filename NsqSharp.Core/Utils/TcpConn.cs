@@ -5,6 +5,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
+using System.Threading.Tasks;
 
 [assembly: InternalsVisibleTo("NsqSharp.Core.Tests")]
 namespace NsqSharp.Utils
@@ -22,20 +23,22 @@ namespace NsqSharp.Utils
         private Stream _networkStream;
         private bool _isClosed;
 
-        public TcpConn(string hostname, int port)
+        TcpConn(TcpClient connection, string hostname)
         {
-            _tcpClient = new TcpClient();
-            _tcpClient.Connect(hostname, port);
+            _tcpClient = connection;
             _networkStream = _tcpClient.GetStream();
-
             _hostname = hostname;
         }
 
-        public void UpgradeTls(TlsConfig tlsConfig)
+        public static async Task<TcpConn> ConnectAsync(string hostName, int port, CancellationToken token = default)
         {
-            if (tlsConfig == null)
-                throw new ArgumentNullException("tlsConfig");
+            var c = new TcpClient();
+            await c.ConnectAsync(hostName, port, token);
+            return new TcpConn(c, hostName);
+        }
 
+        public void UpgradeTLS(TlsConfig tlsConfig)
+        {
             lock (_readLocker)
             {
                 lock (_writeLocker)
@@ -44,7 +47,7 @@ namespace NsqSharp.Utils
 
                     var enabledSslProtocols = tlsConfig.GetEnabledSslProtocols();
 
-                    string errorMessage = null;
+                    string? errorMessage = null;
 
                     var sslStream = new SslStream(
                         _networkStream,
@@ -69,7 +72,7 @@ namespace NsqSharp.Utils
 
         private static bool ValidateCertificates(X509Chain chain, SslPolicyErrors sslPolicyErrors, TlsConfig tlsConfig, out string errorMessage)
         {
-            errorMessage = null;
+            errorMessage = string.Empty;
 
             if ((sslPolicyErrors & SslPolicyErrors.RemoteCertificateNotAvailable) == SslPolicyErrors.RemoteCertificateNotAvailable)
             {
@@ -102,11 +105,10 @@ namespace NsqSharp.Utils
 
         public int Read(byte[] b)
         {
+            if (_isClosed)
+                throw new ConnectionClosedException();
             lock (_readLocker)
             {
-                if (_isClosed)
-                    throw new ConnectionClosedException();
-
                 int byteLength = b.Length;
 
                 int total = _networkStream.Read(b, 0, byteLength);
@@ -126,11 +128,10 @@ namespace NsqSharp.Utils
 
         public int Write(byte[] b, int offset, int length)
         {
+            if (_isClosed)
+                throw new ConnectionClosedException();
             lock (_writeLocker)
             {
-                if (_isClosed)
-                    throw new ConnectionClosedException();
-
                 _networkStream.Write(b, offset, length);
                 return length;
             }
@@ -147,39 +148,38 @@ namespace NsqSharp.Utils
                 {
                     if (_isClosed)
                         return;
-
                     _isClosed = true;
-
-                    try
-                    {
-                        _networkStream.Flush();
-
-                        ReadTimeout = TimeSpan.FromMilliseconds(10);
-                        WriteTimeout = TimeSpan.FromMilliseconds(10);
-
-                        _networkStream.Close();
-                        _tcpClient.Close();
-                    }
-                    catch (SocketException)
-                    {
-                    }
-                    catch (IOException)
-                    {
-                    }
-                    catch (ObjectDisposedException)
-                    {
-                    }
                 }
+                try
+                {
+                    _networkStream.Flush();
+
+                    ReadTimeout = TimeSpan.FromMilliseconds(10);
+                    WriteTimeout = TimeSpan.FromMilliseconds(10);
+
+                    _networkStream.Close();
+                    _tcpClient.Close();
+                }
+                catch (SocketException)
+                {
+                }
+                catch (IOException)
+                {
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                
             }
         }
 
         public void Flush()
         {
+            if (_isClosed)
+                throw new ConnectionClosedException();
+
             lock (_writeLocker)
             {
-                if (_isClosed)
-                    throw new ConnectionClosedException();
-
                 _networkStream.Flush();
             }
         }

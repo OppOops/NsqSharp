@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Threading.Tasks;
 
 namespace NsqSharp.Utils
 {
@@ -34,6 +35,19 @@ namespace NsqSharp.Utils
                     }
                 }
             }
+        }
+
+        public async Task DoAsync(Func<Task> f)
+        {
+            if (_done)
+                return;
+
+            lock (_mtx)
+            {
+                if(!_done)
+                    _done = true;
+            }
+            await f();
         }
     }
 }

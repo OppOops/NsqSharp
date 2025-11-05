@@ -2,17 +2,17 @@
 
   <PropertyGroup>
     <TargetFrameworks>net6.0;net8.0</TargetFrameworks>
+	<ImplicitUsings>enable</ImplicitUsings>
+	<Nullable>enable</Nullable>
+	<RootNamespace>NsqSharp</RootNamespace>
   </PropertyGroup>
 
-
-
-
-	<ItemGroup>
+  <ItemGroup>
     <None Include="..\.gitignore" Link=".gitignore" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Reflection.Emit" Version="4.7.0" />
+    <PackageReference Include="System.Threading.Channels" Version="9.0.10" />
   </ItemGroup>
 
   <ItemGroup>

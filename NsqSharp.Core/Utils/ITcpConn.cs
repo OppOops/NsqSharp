@@ -21,5 +21,6 @@ namespace NsqSharp.Utils
         /// Flush writes all buffered data to the underlying TCP connection
         /// </summary>
         void Flush();
+
     }
 }
