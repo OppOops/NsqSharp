@@ -1505,11 +1505,16 @@ namespace NsqSharp
 
             while (true)
             {
-                var ok = _incomingMessages.Reader.TryPeek(out var message);
+                var ok = _incomingMessages.Reader.WaitToReadAsync().AsTask().Result;
                 if (!ok)
                 {
                     break;
                 }
+                if (!_incomingMessages.Reader.TryRead(out var message))
+                {
+                    continue;
+                }
+                
                 if (message == null)
                     continue;
 
