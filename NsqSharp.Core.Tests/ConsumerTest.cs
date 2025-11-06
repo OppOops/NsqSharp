@@ -30,24 +30,24 @@ namespace NsqSharp.Tests
         }
 
         [Test]
-        public void TestConsumer()
+        public async Task TestConsumer()
         {
-            consumerTest(configSetter: null);
+            await consumerTest(configSetter: null);
         }
 
         [Test]
-        public void TestConsumerTLS()
+        public async Task TestConsumerTLS()
         {
-            consumerTest(c =>
+            await consumerTest(c =>
                          {
                              c.TlsConfig = new TlsConfig { InsecureSkipVerify = true };
                          });
         }
 
         [Test]
-        public void TestConsumerTLSViaSet()
+        public async Task TestConsumerTLSViaSet()
         {
-            consumerTest(c =>
+            await consumerTest(c =>
                          {
                              c.Set("tls_insecure_skip_verify", true);
                          });

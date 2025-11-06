@@ -1,7 +1,7 @@
 NsqSharp.Async
 ========
 
-[![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)&nbsp;&nbsp;[![NuGet version](https://badge.fury.io/nu/nsqsharp.svg)](https://www.nuget.org/packages/nsqsharp)&nbsp;&nbsp;![Nuget](https://img.shields.io/nuget/dt/NsqSharp?label=nuget%20downloads)
+[![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)&nbsp;&nbsp;[![NuGet version](https://badge.fury.io/nu/nsqsharp.async.svg)](https://www.nuget.org/packages/NsqSharp.Async)&nbsp;&nbsp;![Nuget](https://img.shields.io/nuget/dt/NsqSharp.Async?label=nuget%20downloads)
 
 A .NET client library for [NSQ](https://github.com/nsqio/nsq), a realtime distributed messaging platform.
 
@@ -24,75 +24,101 @@ You can also build these files from source: https://github.com/nsqio/nsq (offici
 
 ## C# Examples
 
-`PM> Install-Package NsqSharp.Async`
+`dotnet add package NsqSharp.Async --version 1.0.0`
 
 #### Simple Producer
 
 ```cs
-using System;
-using NsqSharp;
-
-class Program
+static void Main()  
 {
-    static void Main()  
+    var producer = new Producer("127.0.0.1:4150");
+    producer.Publish("test-topic-name", "Hello!");
+
+    Console.WriteLine("Enter your message (blank line to quit):");
+    string line = Console.ReadLine();
+    while (!string.IsNullOrEmpty(line))
     {
-        var producer = new Producer("127.0.0.1:4150");
-        producer.Publish("test-topic-name", "Hello!");
-
-        Console.WriteLine("Enter your message (blank line to quit):");
-        string line = Console.ReadLine();
-        while (!string.IsNullOrEmpty(line))
-        {
-            producer.Publish("test-topic-name", line);
-            line = Console.ReadLine();
-        }
-
-        producer.Stop();
+        producer.Publish("test-topic-name", line, fireAndForgot: false);
+        line = Console.ReadLine();
     }
+    producer.Stop();
 }
+
+// async version
+static async Task Main()  
+{
+    var producer = new Producer("127.0.0.1:4150");
+    await producer.PublishAsync("test-topic-name", "Hello!");
+    producer.Stop();
+}
+
 ```
 
 #### Simple Consumer
 
 ```cs
-using System;
-using System.Text;
-using NsqSharp;
-
-class Program
+static void Main()  
 {
-    static void Main()  
-    {
-        // Create a new Consumer for each topic/channel
-        var consumer = new Consumer("test-topic-name", "channel-name");
-        consumer.AddHandler(new MessageHandler());
-        consumer.ConnectToNsqLookupd("127.0.0.1:4161");
+    // Create a new Consumer for each topic/channel
+    var consumer = new Consumer("test-topic-name", "channel-name");
+    consumer.AddHandler(new MessageHandler());
+    consumer.ConnectToNsqLookupdAsync(new string[] {"127.0.0.1:4161"}).Wait();
 
-        Console.WriteLine("Listening for messages. If this is the first execution, it " +
-                          "could take up to 60s for topic producers to be discovered.");
-        Console.WriteLine("Press enter to stop...");
-        Console.ReadLine();
+    Console.WriteLine("Listening for messages. If this is the first execution, it " +
+                        "could take up to 60s for topic producers to be discovered.");
+    Console.WriteLine("Press enter to stop...");
+    Console.ReadLine();
 
-        consumer.Stop();
-    }
+    consumer.Stop();
+}
+
+//async version
+static async Task Main()  
+{
+    // Create a new Consumer for each topic/channel
+    var appCts = new CancellationTokenSource();
+    var appCtx = appCts.Token;
+    var consumer = new Consumer("test-topic-name", "channel-name");
+    consumer.AddHandler(new MessageHandler());
+    await consumer.ConnectToNsqLookupdAsync(new string[] {"127.0.0.1:4161"}, appCtx);
+
+    Console.WriteLine("Listening for messages. If this is the first execution, it " +
+                        "could take up to 60s for topic producers to be discovered.");
+    Console.WriteLine("Press enter to stop...");
+    Console.ReadLine();
+    // process the graceful exit if you get your context exiting ...
+    // stop consumer
+    await consumer.StopAsync();
 }
 
 public class MessageHandler : IHandler
 {
-    /// <summary>Handles a message.</summary>
+    public bool RunAsAsync => false; // specify this property to indicate use async or sync message handle
+
+    public Task HandleMessageAsync(IMessage message, CancellationToken token)
+    {
+        
+    }
+
     public void HandleMessage(IMessage message)
     {
         string msg = Encoding.UTF8.GetString(message.Body);
         Console.WriteLine(msg);
+        // if not specify, the message will automatically set as finish.
+
+        // the following operation is write to the internal queue 
+        // hence no need to wait message submit its final state.
+
+        // message.Finish() 
+        // message.Touch() 
+
+        // message.ReQueue(delayTime)
+        // message.ReQueueWithoutBackOff(delayTime)
     }
 
-    /// <summary>
-    /// Called when a message has exceeded the specified <see cref="Config.MaxAttempts"/>.
-    /// </summary>
-    /// <param name="message">The failed message.</param>
     public void LogFailedMessage(IMessage message)
     {
-        // Log failed messages
+        
     }
 }
 ```
