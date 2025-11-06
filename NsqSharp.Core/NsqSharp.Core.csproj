@@ -1,25 +1,38 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
-	<ImplicitUsings>enable</ImplicitUsings>
-	<Nullable>enable</Nullable>
-	<RootNamespace>NsqSharp</RootNamespace>
+      <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+	  <ImplicitUsings>enable</ImplicitUsings>
+	  <Nullable>enable</Nullable>
+	  <RootNamespace>NsqSharp</RootNamespace>
+
+	  <PackageId>NsqSharp.Async</PackageId>
+	  <PackageVersion>1.0.0</PackageVersion>
+	  <FileVersion>1.0.0</FileVersion>
+
+	  <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+	  <Description>.net 8+ async/sync implementation of nsq.</Description>
+	  <Authors>OppOops</Authors>
+	  <LangVersion>latest</LangVersion>
+
+	  <IncludeContentInPack>true</IncludeContentInPack>
+	  <PackageTags>nsq;message-queue;asynchronous;concurrent;parallel</PackageTags>
+	  <PackageLicenseFile>LICENSE</PackageLicenseFile>
+	  <PackageReadmeFile>README.md</PackageReadmeFile>
+	  <PackageProjectUrl>https://github.com/OppOops/NsqSharp.Async</PackageProjectUrl>
+	  <RepositoryUrl>https://github.com/OppOops/NsqSharp.Async</RepositoryUrl>
+	  <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="..\.gitignore" Link=".gitignore" />
+    <None Include="..\LICENSE" Pack="true" PackagePath="\" />
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.HighPerformance" Version="8.4.0" />
     <PackageReference Include="System.Threading.Channels" Version="9.0.10" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Compile Update="Consumer.cs">
-      <SubType>Code</SubType>
-    </Compile>
   </ItemGroup>
 
 </Project>
