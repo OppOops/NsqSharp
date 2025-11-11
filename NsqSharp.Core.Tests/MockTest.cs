@@ -76,6 +76,11 @@ namespace NsqSharp.Tests
                 Console.WriteLine("[{0}] {1}: {2}", n.gotTime[i].Formatted(), i, Encoding.UTF8.GetString(n.got[i]));
             }
 
+            //After each message is processed,
+            //the client library should evaluate whether or not it's time to update RDY state.
+
+            //An update should be triggered
+            //if the current value is 0 or if it is below ~25% of the last value sent.
             var expected = new[]
                            {
                                "IDENTIFY",
@@ -391,7 +396,7 @@ namespace NsqSharp.Tests
 
         public async Task<bool> Wait(TimeSpan timeoutDuration)
         {
-            var cts = new System.Threading.CancellationTokenSource(timeoutDuration);
+            using var cts = new System.Threading.CancellationTokenSource(timeoutDuration);
             bool isTtimeout = false;
             cts.Token.Register(()=>
             {
@@ -402,7 +407,9 @@ namespace NsqSharp.Tests
             });
             try
             {
-                await Task.Delay(timeoutDuration, cts.Token);
+                var timeoutTask = Task.Delay(timeoutDuration, cts.Token);
+                var exitTask = exitChan.Task;
+                await Task.WhenAny(timeoutTask, exitTask);
             }
             catch (OperationCanceledException) { }
             

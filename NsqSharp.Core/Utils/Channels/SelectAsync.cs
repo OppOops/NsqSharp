@@ -63,17 +63,19 @@ namespace NsqSharp.Utils.Channels
             _default?.Invoke();
         }
 
-        public async Task TryExecuteAsync(CancellationToken token = default)
+        public async Task<bool> TryExecuteAsync(bool invokeDefault = true, CancellationToken token = default)
         {
             Task? task = readers
                 .Select(x => x.TryReadConsumeAsync(token))
                 .FirstOrDefault(x=>x!=null);
             if (task == null)
             {
-                _default?.Invoke();
-                return;
+                if(invokeDefault)
+                    _default?.Invoke();
+                return false;
             }
             await task;
+            return true;
         }
 
         private async Task<bool> TryExecuteNoDefaultAsync(CancellationToken token = default)

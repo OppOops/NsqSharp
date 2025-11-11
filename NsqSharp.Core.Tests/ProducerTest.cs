@@ -57,7 +57,7 @@ namespace NsqSharp.Tests
         }
 
         [Test]
-        public void TestProducerPublish()
+        public async Task TestProducerPublish()
         {
             var topicName = "publish" + DateTime.Now.Unix();
             const int msgCount = 10;
@@ -73,7 +73,7 @@ namespace NsqSharp.Tests
 
                 w.Publish(topicName, "bad_test_case");
 
-                readMessages(topicName, msgCount);
+                await readMessages(topicName, msgCount);
             }
             finally
             {
@@ -84,7 +84,7 @@ namespace NsqSharp.Tests
         }
 
         [Test]
-        public void TestProducerMultiPublish()
+        public async Task TestProducerMultiPublish()
         {
             var topicName = "multi_publish" + DateTime.Now.Unix();
             const int msgCount = 10;
@@ -102,7 +102,7 @@ namespace NsqSharp.Tests
                 w.MultiPublish(topicName, testData);
                 w.Publish(topicName, "bad_test_case");
 
-                readMessages(topicName, msgCount);
+                await readMessages(topicName, msgCount);
             }
             finally
             {
@@ -113,7 +113,7 @@ namespace NsqSharp.Tests
         }
 
         [Test]
-        public void TestProducerPublishAsync()
+        public async Task TestProducerPublishAsync()
         {
             var topicName = "async_publish" + DateTime.Now.Unix();
             const int msgCount = 10;
@@ -143,7 +143,7 @@ namespace NsqSharp.Tests
 
                 w.Publish(topicName, "bad_test_case");
 
-                readMessages(topicName, msgCount);
+                await readMessages(topicName, msgCount);
             }
             finally
             {
@@ -154,7 +154,7 @@ namespace NsqSharp.Tests
         }
 
         [Test]
-        public void TestProducerMultiPublishAsync()
+        public async Task TestProducerMultiPublishAsync()
         {
             var topicName = "multi_publish" + DateTime.Now.Unix();
             const int msgCount = 10;
@@ -182,7 +182,7 @@ namespace NsqSharp.Tests
 
                 w.Publish(topicName, "bad_test_case");
 
-                readMessages(topicName, msgCount);
+                await readMessages(topicName, msgCount);
             }
             finally
             {
@@ -193,7 +193,7 @@ namespace NsqSharp.Tests
         }
 
         [Test]
-        public void TestProducerHeartbeat()
+        public async Task TestProducerHeartbeat()
         {
             var topicName = "heartbeat" + DateTime.Now.Unix();
 
@@ -232,7 +232,7 @@ namespace NsqSharp.Tests
 
                 w.Publish(topicName, "bad_test_case");
 
-                readMessages(topicName, msgCount + 1);
+                await readMessages(topicName, msgCount + 1);
             }
             finally
             {

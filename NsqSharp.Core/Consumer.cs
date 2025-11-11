@@ -1484,43 +1484,29 @@ namespace NsqSharp
             token = cts.Token;
             while (!token.IsCancellationRequested)
             {
-                var ok = await _incomingMessages.Reader.WaitToReadAsync();
-                if (!ok)
+                try
                 {
+                    var ok = await _incomingMessages.Reader.WaitToReadAsync(token);
+                    if (!ok)
+                    {
+                        break;
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Drain messages
+                    while (_incomingMessages.Reader.TryRead(out var finalMessage))
+                    {
+                        await HandleOneMessage(finalMessage, handler, token);
+                    }
                     break;
                 }
+                
                 if (!_incomingMessages.Reader.TryRead(out var message))
                 {
                     continue;
                 }
-                
-                if (message == null)
-                    continue;
-
-                if (shouldFailMessage(message, handler))
-                {
-                    message.Finish();
-                    continue;
-                }
-
-                try
-                {
-                    message.MaxAttempts = _config.MaxAttempts;
-                    if(handler.RunAsAsync)
-                        await handler.HandleMessageAsync(message, token);
-                    else
-                        handler.HandleMessage(message);
-                }
-                catch (Exception ex)
-                {
-                    log(LogLevel.Error, string.Format("Handler returned error for msg {0} - {1}", message.Id, ex));
-                    if (!message.IsAutoResponseDisabled)
-                        message.ReQueue();
-                    continue;
-                }
-
-                if (!message.IsAutoResponseDisabled)
-                    message.Finish();
+                await HandleOneMessage(message, handler, token);
             }
 
             //exit:
@@ -1529,6 +1515,36 @@ namespace NsqSharp
             {
                 Dispose();
             }
+        }
+
+        private async Task<Exception?> HandleOneMessage(Message message, IHandler handler, CancellationToken token)
+        {
+            if (shouldFailMessage(message, handler))
+            {
+                message.Finish();
+                return null;
+            }
+
+            try
+            {
+                message.MaxAttempts = _config.MaxAttempts;
+                if (handler.RunAsAsync)
+                    await handler.HandleMessageAsync(message, token);
+                else
+                    handler.HandleMessage(message);
+            }
+            catch (Exception ex)
+            {
+                log(LogLevel.Error, string.Format("Handler returned error for msg {0} - {1}", message.Id, ex));
+                if (!message.IsAutoResponseDisabled)
+                    message.ReQueue();
+                return ex;
+            }
+
+            if (!message.IsAutoResponseDisabled)
+                message.Finish();
+
+            return null;
         }
 
         private bool shouldFailMessage(Message message, IHandler handler)

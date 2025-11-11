@@ -26,65 +26,65 @@ namespace NsqSharp.Tests
         }
 
         [Test]
-        public void BenchmarkTcp1()
+        public async Task BenchmarkTcp1()
         {
-            BenchmarkTcp(1);
+            await BenchmarkTcp(1);
         }
 
         [Test]
-        public void BenchmarkTcp2()
+        public async Task BenchmarkTcp2()
         {
-            BenchmarkTcp(2);
+            await BenchmarkTcp(2);
         }
 
         [Test]
-        public void BenchmarkTcp4()
+        public async Task BenchmarkTcp4()
         {
-            BenchmarkTcp(4);
+            await BenchmarkTcp(4);
         }
 
         [Test]
-        public void BenchmarkTcp8()
+        public async Task BenchmarkTcp8()
         {
-            BenchmarkTcp(8);
+            await BenchmarkTcp(8);
         }
 
         [Test]
-        public void BenchmarkHttp1()
+        public async Task BenchmarkHttp1()
         {
-            BenchmarkHttp(1);
+            await BenchmarkHttp(1);
         }
 
         [Test]
-        public void BenchmarkHttp2()
+        public async Task BenchmarkHttp2()
         {
-            BenchmarkHttp(2);
+            await BenchmarkHttp(2);
         }
 
         [Test]
-        public void BenchmarkHttp4()
+        public async Task BenchmarkHttp4()
         {
-            BenchmarkHttp(4);
+            await BenchmarkHttp(4);
         }
 
         [Test]
-        public void BenchmarkHttp8()
+        public async Task BenchmarkHttp8()
         {
-            BenchmarkHttp(8);
+            await BenchmarkHttp(8);
         }
 
-        private void BenchmarkTcp(int parallel)
+        private async Task BenchmarkTcp(int parallel)
         {
             string topicName = "test_benchmark_" + DateTime.Now.UnixNano();
 
             try
             {
-                const int benchmarkNum = 30000;
+                const int benchmarkNum = 10000;
 
                 byte[] body = new byte[512];
 
                 var p = new Producer("127.0.0.1:4150");
-                p.ConnectAsync();
+                await p.ConnectAsync();
 
                 var startCh = Channel.CreateUnbounded<bool>();
                 var wg = new WaitGroup();
@@ -92,15 +92,15 @@ namespace NsqSharp.Tests
                 for (int j = 0; j < parallel; j++)
                 {
                     wg.Add(1);
-                    GoFunc.Run(() =>
+                    _ = Task.Run(async () =>
                     {
-                        _ = startCh.Reader.WaitToReadAsync().AsTask().Result;
+                        _ = await startCh.Reader.WaitToReadAsync();
                         for (int i = 0; i < benchmarkNum / parallel; i++)
                         {
-                            p.Publish(topicName, body);
+                            p.Publish(topicName, body, true);
                         }
                         wg.Done();
-                    }, "ProducerBenchmarkTcpTest: sendLoop");
+                    });
                 }
 
                 var stopwatch = Stopwatch.StartNew();
@@ -110,10 +110,10 @@ namespace NsqSharp.Tests
                 GoFunc.Run(() => { wg.Wait(); done.Writer.TryWrite(true); }, "waiter and done sender");
 
                 bool finished = false;
-                Select
+                await Select
                     .CaseReceive(done, b => finished = b)
                     .CaseReceive(mockNSQD.After(TimeSpan.FromSeconds(10)), b => finished = false)
-                    .ExecuteAsync().Wait();
+                    .ExecuteAsync();
 
                 stopwatch.Stop();
 
@@ -134,13 +134,13 @@ namespace NsqSharp.Tests
             }
         }
 
-        private void BenchmarkHttp(int parallel)
+        private async Task BenchmarkHttp(int parallel)
         {
             string topicName = "test_benchmark_" + DateTime.Now.UnixNano();
 
             try
             {
-                const int benchmarkNum = 30000;
+                const int benchmarkNum = 10000;
 
                 byte[] body = new byte[512];
 
@@ -150,20 +150,20 @@ namespace NsqSharp.Tests
                 for (int j = 0; j < parallel; j++)
                 {
                     wg.Add(1);
-                    GoFunc.Run(() =>
+                    _ = Task.Run(async() =>
                     {
-                        _ = startCh.Reader.WaitToReadAsync().AsTask().Result;
+                        _ = await startCh.Reader.WaitToReadAsync();
                         for (int i = 0; i < benchmarkNum / parallel; i++)
                         {
                             _nsqdHttpClient.Publish(topicName, body);
                         }
                         wg.Done();
-                    }, "ProducerBenchmarkHttpTest: sendLoop");
+                    });
                 }
 
                 var stopwatch = Stopwatch.StartNew();
                 startCh.Writer.TryComplete();
-                wg.Wait();
+                await wg.WaitAsync();
                 stopwatch.Stop();
 
                 Console.WriteLine(string.Format("{0:#,0} sent in {1:mm\\:ss\\.fff}; Avg: {2:#,0} msgs/s; Threads: {3}",

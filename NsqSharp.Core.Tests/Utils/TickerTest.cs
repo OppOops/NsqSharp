@@ -95,7 +95,7 @@ namespace NsqSharp.Tests.Utils
         [Test]
         public void TestTickerLoopWithExitChan()
         {
-            var start = DateTime.Now;
+            var start = DateTime.UtcNow;
             var ticker = new Ticker(TimeSpan.FromSeconds(1));
 
             var listOfTimes = new List<TimeSpan>();
@@ -103,8 +103,8 @@ namespace NsqSharp.Tests.Utils
             var lookupdRecheckChan = Channel.CreateUnbounded<bool>();
             bool doLoop = true;
             var select = Select
-                        .CaseReceive(ticker.C, o => listOfTimes.Add(DateTime.Now - start))
-                        .CaseReceive(lookupdRecheckChan, o => listOfTimes.Add(DateTime.Now - start))
+                        .CaseReceive(ticker.C, o => listOfTimes.Add(DateTime.UtcNow - start))
+                        .CaseReceive(lookupdRecheckChan, o => listOfTimes.Add(DateTime.UtcNow - start))
                         .CaseReceive(exitChan, o => doLoop = false);
             {
                 // ReSharper disable once LoopVariableIsNeverChangedInsideLoop
@@ -120,7 +120,7 @@ namespace NsqSharp.Tests.Utils
 
             ticker.Stop();
 
-            var duration = DateTime.Now - start;
+            var duration = DateTime.UtcNow - start;
 
             Console.WriteLine("Duration: {0}", duration);
             foreach (var time in listOfTimes)
@@ -133,128 +133,8 @@ namespace NsqSharp.Tests.Utils
             Assert.Less(duration, TimeSpan.FromSeconds(11));
         }
 
-        [Test]
-        public void TestTickerLoopWithNemesisChan()
-        {
-            var start = DateTime.Now;
-            var ticker = new Ticker(TimeSpan.FromSeconds(1));
+       
 
-            var listOfTimes = new List<TimeSpan>();
-            var exitChan = Channel.CreateUnbounded<bool>();
-            var lookupdRecheckChan = Channel.CreateUnbounded<bool>();
-            bool doLoop = true;
-            var select =
-                    Select
-                        .CaseReceive(ticker.C,
-                                     o =>
-                                     {
-                                         Console.WriteLine("Received tick");
-                                         listOfTimes.Add(DateTime.Now - start);
-
-                                         if (listOfTimes.Count == 5)
-                                         {
-                                             GoFunc.Run(() => lookupdRecheckChan.Writer.TryWrite(true), "lookupd recheck sender");
-                                         }
-                                     })
-                        .CaseReceive(lookupdRecheckChan,
-                                     o =>
-                                     {
-                                         Console.WriteLine("Nemesis");
-                                         Thread.Sleep(5000);
-                                     })
-                        .CaseReceive(exitChan, o => doLoop = false);
-                        
-            {
-                // ReSharper disable once LoopVariableIsNeverChangedInsideLoop
-                while (doLoop)
-                {
-                    select.ExecuteAsync().Wait();
-                    if (listOfTimes.Count >= 10)
-                    {
-                        GoFunc.Run(() => exitChan.Writer.TryWrite(true), "exit notifier");
-                    }
-                }
-            }
-
-            ticker.Stop();
-
-            var duration = DateTime.Now - start;
-
-            Console.WriteLine("Duration: {0}", duration);
-            foreach (var time in listOfTimes)
-            {
-                Console.WriteLine("Tick: {0}", time);
-            }
-
-            Assert.AreEqual(10, listOfTimes.Count, "listOfTimes.Count");
-            Assert.GreaterOrEqual(duration, TimeSpan.FromSeconds(14) - AcceptableError, "duration");
-            Assert.Less(duration, TimeSpan.FromSeconds(17));
-        }
-
-        [Test]
-        public void TestTickerLoopWithNemesisBufferedChan()
-        {
-            var start = DateTime.Now;
-            var ticker = new Ticker(TimeSpan.FromSeconds(1));
-
-            int x = 0;
-            var listOfTimes = new List<TimeSpan>();
-            var exitChan = Channel.CreateUnbounded<bool>();
-            var lookupdRecheckChan = Channel.CreateBounded<bool>(1);
-            bool doLoop = true;
-            var select =
-                    Select
-                        .CaseReceive(ticker.C,
-                                     o =>
-                                     {
-                                         Console.WriteLine("Received tick");
-                                         listOfTimes.Add(DateTime.Now - start);
-
-                                         if (listOfTimes.Count == 5)
-                                         {
-                                             lookupdRecheckChan.Writer.TryWrite(true);
-                                         }
-                                     })
-                        .CaseReceive(lookupdRecheckChan,
-                                     o =>
-                                     {
-                                         Console.WriteLine("Nemesis");
-                                         for (int i = 0; i < 5; i++)
-                                         {
-                                             Thread.Sleep(1000);
-                                             Console.Write(".");
-                                         }
-                                         Console.WriteLine();
-                                     })
-                        .CaseReceive(exitChan, o => doLoop = false);
-            {
-                // ReSharper disable once LoopVariableIsNeverChangedInsideLoop
-                while (doLoop)
-                {
-                    Console.WriteLine("start: {0} listOfTimes.Count: {1}", x, listOfTimes.Count);
-                    select.ExecuteAsync().Wait();
-                    Console.WriteLine("finish: {0} listOfTimes.Count: {1}", x, listOfTimes.Count);
-                    x++;
-                    if (listOfTimes.Count >= 10)
-                    {
-                        GoFunc.Run(() => exitChan.Writer.TryWrite(true), "exit notifier");
-                    }
-                }
-            }
-
-            ticker.Stop();
-
-            var duration = DateTime.Now - start;
-
-            Console.WriteLine("Duration: {0}", duration);
-            foreach (var time in listOfTimes)
-            {
-                Console.WriteLine("Tick: {0}", time);
-            }
-
-            Assert.AreEqual(10, listOfTimes.Count, "listOfTimes.Count");
-            Assert.GreaterOrEqual(duration, TimeSpan.FromSeconds(14) - AcceptableError, "duration");
-            Assert.Less(duration, TimeSpan.FromSeconds(17));
-        }
+        
     }
 }

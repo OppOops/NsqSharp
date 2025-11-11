@@ -301,8 +301,8 @@ namespace NsqSharp.Core
                 throw;
             }
 
-            var readLoopCtx = new RunningLoopContext(handler.ConnectionCancelContext);
-            var writeLoopCtx = new RunningLoopContext(handler.ConnectionCancelContext);
+            var readLoopCtx = new RunningLoopContext(handler);
+            var writeLoopCtx = new RunningLoopContext(handler);
             _ = RunReadLoop(handler, readLoopCtx);
             _ = RunWriteLoop(handler, writeLoopCtx);
             return resp;
@@ -430,10 +430,15 @@ namespace NsqSharp.Core
 
         private readonly INsqContexet NsqConnectionInstance;
 
+        private Task[] RunningTask = [];
+        
+
         /// <summary>
         /// Cancel if the io stream is closed
         /// </summary>
         public CancellationTokenSource ConnectionCancelContext { get; } = new();
+
+        public CancellationTokenSource GracefullyShutDownContext { get; } = new();
 
         /// <summary>
         /// Initializes a new instance of the <see cref="NsqContext"/> class.
@@ -459,6 +464,31 @@ namespace NsqSharp.Core
         public void Close()
         {
             ConnectionCancelContext.Cancel();
+        }
+
+        public async Task GracefullyCloseAsync(CancellationToken token)
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            cts.CancelAfter(TimeSpan.FromSeconds(30));
+            GracefullyShutDownContext.Cancel();
+            var allTask = Task.WhenAll(RunningTask);
+            var deadlineTask = Task.Delay(Timeout.Infinite, cts.Token);
+            try
+            {
+                await Task.WhenAny(allTask, deadlineTask);
+            }
+            finally
+            {
+                ConnectionCancelContext.Cancel();
+            }
+        }
+
+        public void AddTask(Task t)
+        {
+            lock (this)
+            {
+                this.RunningTask = [.. this.RunningTask, t];
+            }
         }
 
         public ValueTask ReadExactlyAsync(Memory<byte> memory, CancellationToken cancellationToken = default)
@@ -505,17 +535,20 @@ namespace NsqSharp.Core
     {
         public CancellationTokenSource LoopTokenSource { get; }
 
-        private readonly CancellationTokenSource ConnectionTokenSource;
+        public CancellationTokenSource GracefullyShutDownTokenSource { get; }
 
-        public RunningLoopContext(CancellationTokenSource connectionTokenSource)
+        private readonly CoreNsqConnectionHandler _handler;
+
+        public RunningLoopContext(CoreNsqConnectionHandler handler)
         {
-            ConnectionTokenSource = connectionTokenSource;
-            LoopTokenSource = CancellationTokenSource.CreateLinkedTokenSource(connectionTokenSource.Token);
+            LoopTokenSource = CancellationTokenSource.CreateLinkedTokenSource(handler.ConnectionCancelContext.Token);
+            GracefullyShutDownTokenSource = handler.GracefullyShutDownContext;
+            _handler = handler;
         }
 
-        public void SetIoClosing()
+        public void AddTask(Task t)
         {
-            this.ConnectionTokenSource.Cancel();
+            _handler.AddTask(t);
         }
     }
 
@@ -539,6 +572,11 @@ namespace NsqSharp.Core
         public IdentifyResponse Connect(Action<INsqCommandWritter> initialHandshake)
         {
             return Handler.Connect(initialHandshake);
+        }
+
+        public Task GracefullyCloseAsync(CancellationToken token)
+        {
+            return Handler.GracefullyCloseAsync(token);
         }
 
         public void SetLogger(ILogger l, string format)
@@ -566,6 +604,11 @@ namespace NsqSharp.Core
         }
 
         public IdentifyResponse Connect(Action<INsqCommandWritter> initialHandshake)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task GracefullyCloseAsync(CancellationToken token)
         {
             throw new NotImplementedException();
         }
@@ -763,14 +806,25 @@ namespace NsqSharp.Core
         {
             try
             {
-                var cts = readLoopCtx.LoopTokenSource;
-                var token = readLoopCtx.LoopTokenSource.Token;
+                var loopCts = readLoopCtx.LoopTokenSource;
+                var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                    loopCts.Token, 
+                    readLoopCtx.GracefullyShutDownTokenSource.Token);
+                var token = linkedCts.Token;
                 while (!token.IsCancellationRequested)
                 {
                     using var buffer = new NsqBufferContext();
                     try
                     {
                         await buffer.ReadUnpackedResponseAsync(handler, token);
+                    }
+                    catch(TaskCanceledException)
+                    {
+                        break;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
                     }
                     catch (Exception ex)
                     {
@@ -781,7 +835,7 @@ namespace NsqSharp.Core
                             WriteLog(LogLevel.Error, string.Format("IO error on ReadUnpackedResponse - {0}", ex));
                             _delegate.OnIOError(this, ex);
                         }
-                        cts.Cancel();
+                        loopCts.Cancel();
                         break;
                     }
 
@@ -808,7 +862,7 @@ namespace NsqSharp.Core
                             {
                                 WriteLog(LogLevel.Error, string.Format("IO error on DecodeMessage - {0}", ex));
                                 _delegate.OnIOError(this, ex);
-                                cts.Cancel();
+                                loopCts.Cancel();
                                 break;
                             }
                             msg.Delegate = new ConnMessageDelegate(context: this);
@@ -856,7 +910,14 @@ namespace NsqSharp.Core
 
         private async Task RunWriteLoop(CoreNsqConnectionHandler handler, RunningLoopContext writeLoopCtx)
         {
-            var token = writeLoopCtx.LoopTokenSource.Token;
+            var loopCts = writeLoopCtx.LoopTokenSource;
+            var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                loopCts.Token,
+                writeLoopCtx.GracefullyShutDownTokenSource.Token);
+            var token = linkedCts.Token;
+            var gracefulShutDownTaskSource = new TaskCompletionSource<bool>();
+            writeLoopCtx.AddTask(gracefulShutDownTaskSource.Task);
+
             var select =
             Select
                 .CaseReceive(_cmdChan, async(cmd, token) =>
@@ -890,7 +951,7 @@ namespace NsqSharp.Core
                         Dispose();
                     }
                 })
-                .CaseReceive(_consumerMsgResponseChan, resp =>
+                .CaseReceive(_consumerMsgResponseChan, async resp =>
                 {
                     // Decrement this here so it is correct even if we can't respond to nsqd
                     var msgsInFlight = Interlocked.Decrement(ref _messagesInFlight);
@@ -914,7 +975,6 @@ namespace NsqSharp.Core
                             _delegate.OnContinue(this);
                         }
                     }
-
                     WriteCommandToChannel(resp.cmd);
                 });
             
@@ -923,8 +983,38 @@ namespace NsqSharp.Core
             {
                 await select.ExecuteAsync(token);
             }
-
             WriteLog(LogLevel.Info, "writeLoop exiting");
+
+            if (loopCts.IsCancellationRequested)
+                return;
+            // Graceful shutdown
+            try
+            {
+                _consumerMsgResponseChan.Writer.TryComplete();
+
+                token = loopCts.Token;
+                while (!token.IsCancellationRequested)
+                {
+                    var hasTask = await select.TryExecuteAsync(invokeDefault: false, token);
+                    if (!hasTask)
+                        break;
+                }
+
+                _cmdChan.Writer.TryComplete();
+                _cmdTraceChan.Writer.TryComplete();
+
+                while (!token.IsCancellationRequested)
+                {
+                    var hasTask = await select.TryExecuteAsync(invokeDefault: false, token);
+                    if (!hasTask)
+                        break;
+                }
+
+            }
+            finally
+            {
+                gracefulShutDownTaskSource.TrySetResult(true);
+            }
         }
 
         private void Dispose()

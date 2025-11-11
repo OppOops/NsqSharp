@@ -39,6 +39,8 @@ namespace NsqSharp
         /// </summary>
         void Close();
 
+        Task GracefullyCloseAsync(CancellationToken token);
+
         /// <summary>
         /// WriteCommand is a thread safe method to write a Command
         /// to this connection, and flush.
@@ -202,13 +204,18 @@ namespace NsqSharp
         /// </summary>
         public void Stop()
         {
+            StopAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+        }
+
+        public async Task StopAsync(CancellationToken token = default)
+        {
             if (Interlocked.CompareExchange(ref _stopFlag, value: 1, comparand: 0) != 0)
             {
                 // already closed
                 return;
             }
             log(LogLevel.Info, "stopping");
-            CloseTcpConnection();
+            await CloseTcpConnection(graceful: true, token);
             _logger.Flush();
         }
 
@@ -430,7 +437,7 @@ namespace NsqSharp
             }
         }
 
-        private void CloseTcpConnection()
+        private async Task CloseTcpConnection(bool graceful, CancellationToken token = default)
         {
             // no need to lock, user must ensure stop and connect are not called concurrently
             const int newValue = (int)State.Disconnected;
@@ -441,10 +448,23 @@ namespace NsqSharp
             }
             _exitChanTokenSource.Cancel(); // notify stop for sending to nsqd
             _exitChanTokenSource = new CancellationTokenSource(); // recreate for next connection context
-
-            _conn.Close();
+            try
+            {
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                cts.CancelAfter(TimeSpan.FromSeconds(30));
+                if (graceful)
+                    await _conn.GracefullyCloseAsync(cts.Token);
+                else
+                    _conn.Close();
+            }
+            finally
+            {
+                _state = (int)State.Init;
+            }
+            
+            
             //wait
-            _state = (int)State.Init;
+            
         }
 
         private async Task StartProducer(CancellationToken exitToken)
@@ -523,7 +543,7 @@ namespace NsqSharp
 
         void IConnDelegate.OnIOError(NsqContext c, Exception err)
         {
-            CloseTcpConnection();
+            _ = CloseTcpConnection(graceful: false);
         }
 
         void IConnDelegate.OnClose(NsqContext c)

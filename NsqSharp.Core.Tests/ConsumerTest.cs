@@ -176,7 +176,7 @@ namespace NsqSharp.Tests
                 Assert.Throws<ErrNotConnected>(() => q.DisconnectFromNsqd("1.2.3.4:4150"),
                     "should not be able to disconnect from an unknown nsqd");
 
-                Assert.Throws<OperationCanceledException>(() => q.ConnectToNsqdAsync(["1.2.3.4:4150"]).Wait(),
+                Assert.Throws<AggregateException>(() => q.ConnectToNsqdAsync(["1.2.3.4:4150"]).Wait(),
                     "should not be able to connect to non-existent nsqd");
 
                 // should be able to disconnect from an nsqd
